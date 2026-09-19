@@ -1,0 +1,26 @@
+[
+  {
+    "name": "dress.jpeg",
+    "item_id": "f418d2c78c654829a5bbdc86fe56f427",
+    "category": "Uncategorized",
+    "color": null,
+    "image_name": "dress.jpeg",
+    "embedding": null,
+    "confidence": null,
+    "pattern": null,
+    "mask_path": null,
+    "model_status": "Awaiting SAM 2 + FashionCLIP"
+  },
+  {
+    "name": "dress.jpeg",
+    "item_id": "576f5e7b095241d2bad565bde6067dc9",
+    "category": "Uncategorized",
+    "color": null,
+    "image_name": "dress.jpeg",
+    "embedding": null,
+    "confidence": null,
+    "pattern": null,
+    "mask_path": null,
+    "model_status": "Awaiting SAM 2 + FashionCLIP"
+  }
+]
