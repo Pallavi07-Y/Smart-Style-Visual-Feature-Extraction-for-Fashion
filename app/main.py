@@ -2,15 +2,18 @@ import hashlib
 from pathlib import Path
 
 import streamlit as st
+import pandas as pd
 
 from core.schemas import UserProfile, WardrobeItem
 from core.wardrobe_store import WardrobeStore
 from features.body_shape import analyze_body_shape
-from features.clothing_detection import detect_and_classify_clothing
-from features.digital_wardrobe import segment_and_tag_clothing
+from features.clothing_detection import detect_and_classify_clothing, detect_clothing
+from features.digital_wardrobe import get_fashion_embedding, segment_clothing_items, segment_and_tag_clothing
 from features.virtual_try_on import generate_virtual_try_on
 from features.face_shape import analyze_face_shape
 from features.skin_tone import analyze_skin_tone
+from features.planner import generate_weekly_plan, regenerate_day
+from features.recommendation import recommend_outfits
 
 
 FACE_LANDMARKER_MODEL = Path(__file__).resolve().parents[1] / "models" / "face_landmarker.task"
@@ -18,6 +21,7 @@ POSE_LANDMARKER_MODEL = Path(__file__).resolve().parents[1] / "models" / "pose_l
 SAM2_CHECKPOINT = Path(__file__).resolve().parents[1] / "models" / "sam2_hiera_small.pt"
 YOLO11_CHECKPOINT = Path(__file__).resolve().parents[1] / "models" / "yolo11n.pt"
 WARDROBE_STORE = WardrobeStore(Path(__file__).resolve().parents[1] / "data" / "wardrobe" / "items.json")
+WARDROBE_IMAGE_DIR = Path(__file__).resolve().parents[1] / "data" / "wardrobe" / "images"
 
 
 def _image_signature(image_bytes: bytes | None) -> str | None:
@@ -243,8 +247,15 @@ if view == "Overview":
 
     st.markdown('<div class="section-title">A starting direction</div>', unsafe_allow_html=True)
     rec_left, rec_right = st.columns([1.25, 0.75], gap="medium")
+    recommendations = recommend_outfits(profile, st.session_state.wardrobe_items, profile.occasion, top_k=1)
     with rec_left:
-        st.markdown(f'<div class="recommendation"><div class="eyebrow" style="color:#e8c56a">{profile.occasion.upper()} EDIT</div><h3>Your recommendation space is ready.</h3><p>Once the visual modules are connected, this panel will combine your profile, wardrobe, and occasion into a considered outfit rather than a generic list.</p></div>', unsafe_allow_html=True)
+        if recommendations:
+            recommendation = recommendations[0]
+            item_names = " + ".join(item.name for item in recommendation.items)
+            reasons = " ".join(recommendation.reasons)
+            st.markdown(f'<div class="recommendation"><div class="eyebrow" style="color:#e8c56a">{profile.occasion.upper()} EDIT</div><h3>{item_names}</h3><p>Score {recommendation.score:.0%}. {reasons}</p></div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="recommendation"><div class="eyebrow" style="color:#e8c56a">{profile.occasion.upper()} EDIT</div><h3>Your wardrobe needs more detail.</h3><p>Add categorized pieces to generate a transparent outfit recommendation.</p></div>', unsafe_allow_html=True)
     with rec_right:
         st.markdown('<div class="feature"><span class="status">Pipeline staged</span><h3>Next signal</h3><p>Add the Face and Pose Landmarker checkpoints to activate the complete visual profile.</p></div>', unsafe_allow_html=True)
 
@@ -253,25 +264,44 @@ elif view == "My wardrobe":
     st.caption("Upload pieces now, edit their tags below, and connect SAM 2/FashionCLIP checkpoints when ready.")
     wardrobe_file = st.file_uploader("Add a wardrobe piece", type=["jpg", "jpeg", "png"], key="wardrobe_page_upload")
     if wardrobe_file and st.button("Add to wardrobe", use_container_width=True):
-        item = WardrobeItem(name=wardrobe_file.name, image_name=wardrobe_file.name, model_status="Manual tags")
+        image_bytes = wardrobe_file.getvalue()
         try:
-            tag_result = segment_and_tag_clothing(wardrobe_file.getvalue(), SAM2_CHECKPOINT)
-            item.category = tag_result.category
-            item.color = tag_result.color
-            item.pattern = tag_result.pattern
-            item.embedding = tag_result.embedding
-            item.confidence = tag_result.confidence
-            item.mask_path = tag_result.mask_path
-            item.model_status = tag_result.model_status
-        except (FileNotFoundError, ImportError, NotImplementedError) as error:
-            item.model_status = str(error)
-        item = WARDROBE_STORE.add(item)
-        st.session_state.wardrobe_items.append(item)
-        st.success(f"Added {item.name}.")
-        st.rerun()
+            detection = detect_clothing(image_bytes, YOLO11_CHECKPOINT)
+            if not detection.detections:
+                st.warning("No objects were detected. Use a clearer clothing image or a fashion-trained YOLO checkpoint.")
+            else:
+                segmented_items = segment_clothing_items(image_bytes, detection.detections)
+                added = 0
+                for index, segmented in enumerate(segmented_items, start=1):
+                    item_hash = _image_signature(Path(segmented.crop_path).read_bytes())
+                    duplicate = next((stored for stored in st.session_state.wardrobe_items if stored.image_hash == item_hash), None)
+                    if duplicate:
+                        continue
+                    item = WardrobeItem(
+                        name=f"{Path(wardrobe_file.name).stem} {index}",
+                        image_name=Path(segmented.crop_path).name,
+                        image_path=segmented.crop_path,
+                        image_hash=item_hash,
+                        category=segmented.label,
+                        color=segmented.color,
+                        pattern=segmented.pattern,
+                        embedding=segmented.embedding,
+                        confidence=segmented.confidence,
+                        mask_path=segmented.mask_path,
+                        model_status=segmented.model_status,
+                    )
+                    saved_item = WARDROBE_STORE.add(item)
+                    st.session_state.wardrobe_items.append(saved_item)
+                    added += 1
+                st.success(f"Added {added} detected wardrobe item(s).")
+                st.rerun()
+        except (FileNotFoundError, ImportError, TypeError, ValueError, RuntimeError) as error:
+            st.warning(str(error))
     if st.session_state.wardrobe_items:
         for item in st.session_state.wardrobe_items:
             with st.expander(item.name):
+                if item.image_path and Path(item.image_path).exists():
+                    st.image(item.image_path, caption=item.name, use_container_width=True)
                 st.caption(item.model_status or "No model status")
                 category = st.selectbox("Category", ["Top", "Bottom", "Dress", "Outerwear", "Shoes", "Accessory", "Uncategorized"], index=_option_index(["Top", "Bottom", "Dress", "Outerwear", "Shoes", "Accessory", "Uncategorized"], item.category), key=f"category_{item.item_id}")
                 color = st.text_input("Color", value=item.color or "", key=f"color_{item.item_id}")
@@ -293,21 +323,39 @@ elif view == "My wardrobe":
 
 elif view == "Clothing scan":
     st.markdown('<div class="eyebrow">CLOTHING DETECTION / 04</div><h2>Read an outfit at a glance.</h2>', unsafe_allow_html=True)
-    st.caption("YOLO11 finds clothing regions; FashionCLIP supplies fashion categories and embeddings for search and similarity.")
+    st.caption("YOLO detects the classes supported by the configured checkpoint. FashionCLIP is not used by this screen.")
     scan_file = st.file_uploader("Upload an outfit image", type=["jpg", "jpeg", "png"], key="clothing_scan")
     if scan_file and st.button("Detect clothing", use_container_width=True):
         try:
             detection = detect_and_classify_clothing(scan_file.getvalue(), YOLO11_CHECKPOINT)
             st.session_state.clothing_detection = detection
-            st.success(f"Detected {len(detection.detections)} clothing items.")
+            st.success(f"Detected {len(detection.detections)} objects above the confidence threshold.")
         except FileNotFoundError:
             st.info("Add models/yolo11n.pt to enable YOLO11 detection.")
-        except ImportError as error:
-            st.warning(str(error))
-        except NotImplementedError as error:
+        except (ImportError, TypeError, ValueError, RuntimeError) as error:
             st.warning(str(error))
     detection = st.session_state.get("clothing_detection")
     if detection:
+        st.image(detection.annotated_image, caption="YOLO annotated output", use_container_width=True)
+        st.caption(f"Device: {detection.device} · Confidence threshold: {detection.confidence_threshold:.2f}")
+        if detection.model_classes:
+            st.info(f"{detection.model_status} Classes: {', '.join(detection.model_classes)}")
+        if not detection.detections:
+            st.info("No objects were detected above the confidence threshold.")
+        rows = [
+            {
+                "Item": item.category,
+                "Label": item.label,
+                "Confidence": f"{item.confidence:.1%}",
+                "X1": item.bbox[0],
+                "Y1": item.bbox[1],
+                "X2": item.bbox[2],
+                "Y2": item.bbox[3],
+            }
+            for item in detection.detections
+        ]
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         for index, detected_item in enumerate(detection.detections, start=1):
             st.markdown(f'<div class="metric" style="margin:0.5rem 0"><b>{index}. {detected_item.category}</b><br><span class="metric-label">confidence {detected_item.confidence:.0%} · box {detected_item.box}</span></div>', unsafe_allow_html=True)
 
@@ -334,9 +382,25 @@ elif view == "Virtual try-on":
 
 else:
     st.markdown('<div class="eyebrow">PLANNER / 03</div><h2>A week that gets easier to dress for.</h2>', unsafe_allow_html=True)
-    st.info("The constraint-based weekly planner will use your wardrobe, occasions, laundry cadence, and outfit history here.")
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    default_occasions = ["Work", "Work", "Work", "Work", "Work", "Weekend", "Weekend"]
+    occasions = []
     planner_columns = st.columns(7, gap="small")
-    for column, day in zip(planner_columns, days):
+    for index, (column, day) in enumerate(zip(planner_columns, days)):
         with column:
-            st.markdown(f'<div class="metric"><div class="eyebrow">{day}</div><p style="color:var(--muted);font-size:0.78rem">Not planned</p></div>', unsafe_allow_html=True)
+            occasion = st.selectbox("Occasion", ["Everyday", "Work", "Date night", "Wedding guest", "Travel", "Weekend"], index=_option_index(["Everyday", "Work", "Date night", "Wedding guest", "Travel", "Weekend"], default_occasions[index]), key=f"planner_occasion_{day}", label_visibility="collapsed")
+            occasions.append(occasion)
+    if st.button("Generate weekly plan", use_container_width=True):
+        st.session_state.weekly_plan = generate_weekly_plan(profile, st.session_state.wardrobe_items, occasions, days)
+    weekly_plan = st.session_state.get("weekly_plan")
+    if weekly_plan:
+        plan_columns = st.columns(7, gap="small")
+        for index, (column, planned_day) in enumerate(zip(plan_columns, weekly_plan.days)):
+            with column:
+                outfit_text = " + ".join(item.name for item in planned_day.outfit.items) if planned_day.outfit else "Not planned"
+                st.markdown(f'<div class="metric"><div class="eyebrow">{planned_day.day}</div><strong>{outfit_text}</strong><p style="color:var(--muted);font-size:0.78rem">{planned_day.occasion}</p><p style="color:var(--muted);font-size:0.78rem">{planned_day.reason}</p></div>', unsafe_allow_html=True)
+                if st.button("Regenerate", key=f"regenerate_{planned_day.day}", use_container_width=True):
+                    st.session_state.weekly_plan = regenerate_day(weekly_plan, index, profile, st.session_state.wardrobe_items)
+                    st.rerun()
+    else:
+        st.info("Generate a week from the pieces currently stored in your wardrobe.")

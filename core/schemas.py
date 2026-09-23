@@ -9,6 +9,8 @@ class WardrobeItem:
     category: str = "Uncategorized"
     color: Optional[str] = None
     image_name: Optional[str] = None
+    image_path: Optional[str] = None
+    image_hash: Optional[str] = None
     embedding: Optional[List[float]] = None
     confidence: Optional[float] = None
     pattern: Optional[str] = None
