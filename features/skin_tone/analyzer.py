@@ -16,6 +16,9 @@ class SkinToneResult:
     dominant_share: float
     confidence: float
     sample_count: int
+    skin_pixel_mean_lab: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    skin_pixel_std_lab: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    face_landmarks: Tuple[Tuple[float, float], ...] = ()
 
 
 def analyze_skin_tone(
@@ -87,6 +90,9 @@ def analyze_skin_tone(
         dominant_share=round(share, 2),
         confidence=round(min(0.99, 0.5 + share / 2), 2),
         sample_count=len(pixels),
+        skin_pixel_mean_lab=tuple(round(float(value), 2) for value in pixels.mean(axis=0)),
+        skin_pixel_std_lab=tuple(round(float(value), 2) for value in pixels.std(axis=0)),
+        face_landmarks=tuple((round(float(landmark.x), 5), round(float(landmark.y), 5)) for landmark in landmarks),
     )
 
 
@@ -98,6 +104,19 @@ def _skin_region_mask(landmarks, width, height, cv2, np):
     for exclusion in _EXCLUDED_FEATURES:
         cv2.fillPoly(mask, [np.array([points[index] for index in exclusion], dtype=np.int32)], 0)
     return mask
+
+
+def skin_region_mask_from_normalized_landmarks(landmarks, width: int, height: int):
+    """Build the same facial skin ROI used by analysis for visualization."""
+    import cv2
+    import numpy as np
+
+    class Point:
+        def __init__(self, x, y):
+            self.x, self.y = x, y
+
+    points = [Point(x, y) for x, y in landmarks]
+    return _skin_region_mask(points, width, height, cv2, np)
 
 
 # MediaPipe's stable face-mesh indices define the outer face and non-skin features.

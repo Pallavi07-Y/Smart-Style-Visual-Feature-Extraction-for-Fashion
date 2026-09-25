@@ -8,6 +8,8 @@ class FaceShapeResult:
     shape: str
     confidence: float
     face_box: Tuple[float, float, float, float]
+    feature_ratios: dict[str, float] = None
+    landmarks: Tuple[Tuple[float, float], ...] = ()
 
 
 def analyze_face_shape(image_bytes: bytes, model_path: str | Path) -> FaceShapeResult:
@@ -43,12 +45,16 @@ def analyze_face_shape(image_bytes: bytes, model_path: str | Path) -> FaceShapeR
         raise ValueError("No face was detected. Use a clear, front-facing portrait.")
 
     landmarks = result.face_landmarks[0]
-    points = np.array([(landmark.x, landmark.y) for landmark in landmarks], dtype=np.float32)
-    shape, confidence = _classify_shape(points)
+    normalized_points = np.array([(landmark.x, landmark.y) for landmark in landmarks], dtype=np.float32)
+    height, width = bgr_image.shape[:2]
+    pixel_points = normalized_points * np.array([width, height], dtype=np.float32)
+    shape, confidence, feature_ratios = _classify_shape(pixel_points)
     return FaceShapeResult(
         shape=shape,
         confidence=confidence,
-        face_box=_face_box(points),
+        face_box=_face_box(normalized_points),
+        feature_ratios=feature_ratios,
+        landmarks=tuple((round(float(point[0]), 5), round(float(point[1]), 5)) for point in normalized_points),
     )
 
 
@@ -79,7 +85,13 @@ def _classify_shape(points):
         shape = "Oval"
 
     confidence = min(0.96, 0.62 + abs(length_ratio - 1.35) * 0.2)
-    return shape, round(float(confidence), 2)
+    feature_ratios = {
+        "face_length_width": round(float(length_ratio), 4),
+        "jaw_cheek_width": round(float(jaw_ratio), 4),
+        "forehead_cheek_width": round(float(forehead_ratio), 4),
+        "cheek_forehead_width": round(float(cheek_width / forehead_width), 4),
+    }
+    return shape, round(float(confidence), 2), feature_ratios
 
 
 def _distance(points, first: int, second: int) -> float:

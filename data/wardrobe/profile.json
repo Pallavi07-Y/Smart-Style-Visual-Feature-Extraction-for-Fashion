@@ -1,0 +1,40 @@
+{
+  "gender": "Male",
+  "face_shape": "Diamond",
+  "skin_tone": "Deep",
+  "undertone": "Warm",
+  "body_shape": "Inverted triangle",
+  "preferred_colors": [
+    "Emerald green",
+    "Terracotta",
+    "Cream",
+    "Navy blue",
+    "Maroon"
+  ],
+  "style_preferences": [],
+  "occasion": "Outdoor",
+  "profile_image_path": "C:\\Users\\avire\\Desktop\\MAIN PROJECTS\\smartstyle\\Smart-Style-Visual-Feature-Extraction-for-Fashion\\data\\wardrobe\\images\\profile_profile.png",
+  "analysis_date": "2026-09-25",
+  "extracted_features": {
+    "face": {
+      "face_length_width": 1.1768,
+      "jaw_cheek_width": 0.8045,
+      "forehead_cheek_width": 0.8686,
+      "cheek_forehead_width": 1.1513
+    },
+    "skin": {
+      "lab_mean": [
+        76.98,
+        139.68,
+        141.67
+      ],
+      "lab_std": [
+        18.35,
+        4.21,
+        3.37
+      ],
+      "sample_count": 5115
+    },
+    "body": {}
+  }
+}

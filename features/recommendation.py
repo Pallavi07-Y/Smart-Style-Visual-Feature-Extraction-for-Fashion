@@ -3,6 +3,7 @@ from itertools import combinations
 from typing import Iterable, Sequence
 
 from core.schemas import UserProfile, WardrobeItem
+from core.scoring_engine import weighted_score
 
 
 @dataclass(frozen=True)
@@ -41,18 +42,21 @@ def score_outfit(
     items = tuple(item for item in outfit if item and item.item_id)
     categories = {_category(item) for item in items}
     category_score = _category_compatibility(categories)
-    color_score = _color_compatibility(items)
+    color_score = _color_compatibility(items, profile)
     occasion_score = _occasion_compatibility(items, target_occasion)
     style_score = _style_compatibility(profile, items)
-    availability_score = 1.0 if items and len({item.item_id for item in items}) == len(items) else 0.0
+    body_shape_score = _body_shape_compatibility(profile.body_shape, items)
+    comfort_score = _comfort_compatibility(items, target_occasion)
     components = {
-        "category_compatibility": category_score,
         "color_compatibility": color_score,
+        "body_shape_compatibility": body_shape_score,
         "occasion_compatibility": occasion_score,
+        "comfort_practicality": comfort_score,
+        "style_relevance": style_score,
         "style_compatibility": style_score,
-        "wardrobe_availability": availability_score,
+        "category_compatibility": category_score,
     }
-    score = round(sum(components.values()) / len(components), 4)
+    score = weighted_score(components)
     reasons = _explain(components, categories, target_occasion, items)
     return OutfitCandidate(items=items, score=score, components=components, reasons=reasons)
 
@@ -106,23 +110,32 @@ def _category_compatibility(categories: set[str]) -> float:
     return 0.45
 
 
-def _color_compatibility(items: Sequence[WardrobeItem]) -> float:
+def _color_compatibility(items: Sequence[WardrobeItem], profile: UserProfile | None = None) -> float:
     colors = [item.color.strip().lower() for item in items if item.color]
     if len(colors) < 2:
-        return 0.55
+        base = 0.55
+        preferred = {value.lower() for value in (profile.preferred_colors if profile else [])}
+        return min(1.0, base + 0.12) if any(color in preferred for color in colors) else base
     neutral = {"black", "white", "cream", "ivory", "grey", "gray", "navy", "beige", "brown", "denim"}
     if all(color in neutral for color in colors):
-        return 0.95
-    if any(color in neutral for color in colors):
-        return 0.85
-    return 0.7 if len(set(colors)) <= 2 else 0.45
+        base = 0.95
+    elif any(color in neutral for color in colors):
+        base = 0.85
+    else:
+        base = 0.7 if len(set(colors)) <= 2 else 0.45
+    preferred = {value.lower() for value in (profile.preferred_colors if profile else [])}
+    return min(1.0, base + 0.08) if any(color in preferred for color in colors) else base
 
 
 def _occasion_compatibility(items: Sequence[WardrobeItem], occasion: str) -> float:
     target = occasion.lower()
     categories = {_category(item) for item in items}
-    if target in {"wedding guest", "date night"} and ("dress" in categories or "outerwear" in categories):
+    if target in {"wedding", "traditional", "party", "dinner"} and ("dress" in categories or "outerwear" in categories):
         return 0.9
+    if target in {"formal", "presentation", "interview"} and categories & {"top", "bottom", "dress", "outerwear"}:
+        return 0.92
+    if target in {"college", "casual", "travel", "outdoor"} and categories & {"top", "bottom", "dress"}:
+        return 0.86
     if target == "work" and categories & {"top", "bottom", "dress", "outerwear"}:
         return 0.85
     if target in {"travel", "weekend", "everyday"}:
@@ -139,6 +152,27 @@ def _style_compatibility(profile: UserProfile, items: Sequence[WardrobeItem]) ->
     return min(1.0, 0.55 + matches * 0.15)
 
 
+def _body_shape_compatibility(body_shape: str | None, items: Sequence[WardrobeItem]) -> float:
+    shape = (body_shape or "").lower()
+    text = " ".join(f"{item.name} {item.subcategory or ''} {item.fit or ''} {item.style or ''}".lower() for item in items)
+    rules = {
+        "pear": ("a-line", "fit & flare", "wide-leg", "straight", "balanced"),
+        "hourglass": ("wrap", "waist", "fitted", "semi-fitted", "high-waist"),
+        "rectangle": ("layer", "waist", "a-line", "fit & flare"),
+        "apple": ("a-line", "straight", "relaxed", "structured"),
+        "inverted triangle": ("a-line", "wide-leg", "balanced"),
+    }
+    matches = sum(term in text for term in rules.get(shape, ()))
+    return min(1.0, 0.72 + matches * 0.08) if shape else 0.72
+
+
+def _comfort_compatibility(items: Sequence[WardrobeItem], occasion: str) -> float:
+    text = " ".join(f"{item.name} {item.fit or ''} {item.style or ''}".lower() for item in items)
+    if occasion.lower() in {"college", "travel", "outdoor"}:
+        return 0.95 if any(term in text for term in ("comfortable", "relaxed", "flat", "sneaker")) else 0.78
+    return 0.9 if any(term in text for term in ("semi-fitted", "structured", "comfortable")) else 0.78
+
+
 def _explain(components: dict[str, float], categories: set[str], occasion: str, items: Sequence[WardrobeItem]) -> tuple[str, ...]:
     reasons = []
     if components["category_compatibility"] >= 0.8:
@@ -151,6 +185,6 @@ def _explain(components: dict[str, float], categories: set[str], occasion: str, 
         reasons.append(f"The combination suits the {occasion.lower()} occasion.")
     if components["style_compatibility"] >= 0.7:
         reasons.append("The available style preferences align with the selected pieces.")
-    if components["wardrobe_availability"] == 1.0:
-        reasons.append(f"Every piece is available in the wardrobe ({len(items)} selected).")
+    if components.get("body_shape_compatibility", 0) >= 0.8:
+        reasons.append("The silhouette tags align with the detected body-shape styling guidance.")
     return tuple(reasons)

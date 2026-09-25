@@ -16,6 +16,7 @@ class BodyShapeResult:
     leg_length: float
     visibility: float
     landmark_box: Tuple[float, float, float, float]
+    landmarks: Tuple[Tuple[float, float], ...] = ()
 
 
 def analyze_body_shape(image_bytes: bytes, model_path: str | Path) -> BodyShapeResult:
@@ -51,6 +52,11 @@ def analyze_body_shape(image_bytes: bytes, model_path: str | Path) -> BodyShapeR
         raise ValueError("No full body was detected. Use a standing, full-body photo.")
 
     landmarks = result.pose_landmarks[0]
+    height, width = bgr_image.shape[:2]
+
+    def pixel(point):
+        return point.x * width, point.y * height
+
     shoulder_left, shoulder_right = landmarks[11], landmarks[12]
     hip_left, hip_right = landmarks[23], landmarks[24]
     ankle_left, ankle_right = landmarks[27], landmarks[28]
@@ -61,11 +67,16 @@ def analyze_body_shape(image_bytes: bytes, model_path: str | Path) -> BodyShapeR
         if point.visibility is not None
     ]
     visibility = float(sum(visibility_values) / len(visibility_values))
-    shoulder_width = _distance(shoulder_left.x, shoulder_left.y, shoulder_right.x, shoulder_right.y)
-    hip_width = _distance(hip_left.x, hip_left.y, hip_right.x, hip_right.y)
-    torso_length = _distance((shoulder_left.x + shoulder_right.x) / 2, (shoulder_left.y + shoulder_right.y) / 2, (hip_left.x + hip_right.x) / 2, (hip_left.y + hip_right.y) / 2)
+    shoulder_left_xy, shoulder_right_xy = pixel(shoulder_left), pixel(shoulder_right)
+    hip_left_xy, hip_right_xy = pixel(hip_left), pixel(hip_right)
+    ankle_left_xy, ankle_right_xy = pixel(ankle_left), pixel(ankle_right)
+    knee_left_xy, knee_right_xy = pixel(knee_left), pixel(knee_right)
+    shoulder_width = _distance(*shoulder_left_xy, *shoulder_right_xy)
+    hip_width = _distance(*hip_left_xy, *hip_right_xy)
+    torso_length = _distance((shoulder_left_xy[0] + shoulder_right_xy[0]) / 2, (shoulder_left_xy[1] + shoulder_right_xy[1]) / 2, (hip_left_xy[0] + hip_right_xy[0]) / 2, (hip_left_xy[1] + hip_right_xy[1]) / 2)
     leg_points = (ankle_left, ankle_right) if _visible(ankle_left) and _visible(ankle_right) else (knee_left, knee_right)
-    leg_length = (_distance(hip_left.x, hip_left.y, leg_points[0].x, leg_points[0].y) + _distance(hip_right.x, hip_right.y, leg_points[1].x, leg_points[1].y)) / 2
+    leg_xy = (ankle_left_xy, ankle_right_xy) if _visible(ankle_left) and _visible(ankle_right) else (knee_left_xy, knee_right_xy)
+    leg_length = (_distance(*hip_left_xy, *leg_xy[0]) + _distance(*hip_right_xy, *leg_xy[1])) / 2
     if min(shoulder_width, hip_width, torso_length, leg_length) == 0 or visibility < 0.25:
         raise ValueError("Pose landmarks did not provide enough geometry for classification.")
 
@@ -83,6 +94,7 @@ def analyze_body_shape(image_bytes: bytes, model_path: str | Path) -> BodyShapeR
         leg_length=round(leg_length, 3),
         visibility=round(visibility, 2),
         landmark_box=_landmark_box(points),
+        landmarks=tuple((round(float(point[0]), 5), round(float(point[1]), 5)) for point in points),
     )
 
 

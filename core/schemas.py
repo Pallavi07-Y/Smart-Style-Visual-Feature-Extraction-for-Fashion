@@ -16,17 +16,33 @@ class WardrobeItem:
     pattern: Optional[str] = None
     mask_path: Optional[str] = None
     model_status: Optional[str] = None
+    subcategory: Optional[str] = None
+    style: Optional[str] = None
+    fit: Optional[str] = None
+    occasion: Optional[str] = None
+    last_worn: Optional[str] = None
+    times_worn: int = 0
+    secondary_color: Optional[str] = None
+    date_added: Optional[str] = None
+    suitable_occasions: List[str] = field(default_factory=list)
+    extracted_features: dict = field(default_factory=dict)
+    classification_uncertain: bool = False
 
 
 @dataclass
 class UserProfile:
+    gender: Optional[str] = None
     face_shape: Optional[str] = None
     skin_tone: Optional[str] = None
+    undertone: Optional[str] = None
     body_shape: Optional[str] = None
     wardrobe_items: List[WardrobeItem] = field(default_factory=list)
     preferred_colors: List[str] = field(default_factory=list)
     style_preferences: List[str] = field(default_factory=list)
     occasion: str = "Everyday"
+    profile_image_path: Optional[str] = None
+    analysis_date: Optional[str] = None
+    extracted_features: dict = field(default_factory=dict)
 
     @property
     def analysis_count(self) -> int:
