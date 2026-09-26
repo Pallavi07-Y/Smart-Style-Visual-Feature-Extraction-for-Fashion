@@ -101,9 +101,9 @@ def analyze_body_shape(image_bytes: bytes, model_path: str | Path) -> BodyShapeR
 def _classify_shape(shoulder_width: float, hip_width: float, torso_length: float, leg_length: float) -> Tuple[str, str, Tuple[str, ...], float]:
     ratio = shoulder_width / hip_width
     leg_torso_ratio = leg_length / torso_length
-    if ratio >= 1.28:
+    if ratio >= 1.35:
         shape, detail, features = "Inverted triangle", "Your upper body carries more visual width than your lower body.", ("Shoulder line is the strongest feature.", "Structured jackets and open necklines can balance the silhouette.", "Bottoms with volume or detail can create visual balance.")
-    elif ratio >= 1.12:
+    elif ratio >= 1.15:
         shape, detail, features = "Athletic", "Your frame reads strong through the shoulders with a gently narrowing lower body.", ("Shoulders create a clean, athletic line.", "Straight and softly tailored garments are likely to sit well.", "Texture or detail at the hip can add balance.")
     elif ratio <= 0.78:
         shape, detail, features = "Pear", "Your lower body carries more visual width than your upper body.", ("Hip line is the strongest feature.", "Bright or detailed tops can draw the eye upward.", "Fluid or darker lower layers can create a long line.")

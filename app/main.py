@@ -1,7 +1,9 @@
 import hashlib
-from datetime import date
+from datetime import date, datetime, timedelta
+from html import escape
 from pathlib import Path
 import sys
+from typing import Any
 from urllib.parse import quote_plus
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -12,15 +14,15 @@ import streamlit as st
 
 from core.color_engine import colors_to_use_carefully, recommend_colors
 from core.schemas import UserProfile, WardrobeItem
-from core.scoring_engine import weighted_score
-from core.wardrobe_analysis import analyze_wardrobe_image
+from core.wardrobe_analysis import NotClothingImageError, analyze_wardrobe_image
 from core.wardrobe_store import WardrobeStore
 from features.body_shape import analyze_body_shape
 from features.face_shape import analyze_face_shape
 from features.planner import generate_weekly_plan
-from features.recommendation import recommend_outfits
+from features.recommendation import is_outfit_suitable_for_occasion, recommend_outfits
 from features.skin_tone import analyze_skin_tone
 from features.skin_tone.analyzer import skin_region_mask_from_normalized_landmarks
+from features.style_guidance import suggest_body_shape_outfits
 
 FACE_MODEL = PROJECT_ROOT / "models" / "face_landmarker.task"
 POSE_MODEL = PROJECT_ROOT / "models" / "pose_landmarker_lite.task"
@@ -45,41 +47,15 @@ def _profile() -> UserProfile:
     if "wardrobe_items" not in st.session_state:
         st.session_state.wardrobe_items = WARDROBE_STORE.load()
     profile = st.session_state.profile
-    for field, default in (("gender", None), ("profile_image_path", None), ("analysis_date", None), ("extracted_features", {})):
+    for field, default in (("gender", None), ("profile_image_path", None), ("analysis_date", None), ("analysis_timestamp", None), ("extracted_features", {})):
         if not hasattr(profile, field):
             setattr(profile, field, default.copy() if isinstance(default, dict) else default)
     profile.wardrobe_items = st.session_state.wardrobe_items
     for item in profile.wardrobe_items:
-        for field, default in (("secondary_color", None), ("date_added", None), ("suitable_occasions", []), ("extracted_features", {}), ("classification_uncertain", False)):
+        for field, default in (("secondary_color", None), ("date_added", None), ("suitable_occasions", []), ("extracted_features", {}), ("classification_uncertain", False), ("market_category", "Unknown")):
             if not hasattr(item, field):
                 setattr(item, field, list(default) if isinstance(default, list) else default)
-    _backfill_wardrobe_analysis(profile.wardrobe_items)
     return profile
-
-
-def _backfill_wardrobe_analysis(items: list[WardrobeItem]) -> None:
-    """Analyze legacy stored images once so old records are not left blank."""
-    changed = False
-    for item in items:
-        image_path = _stored_image_path(item)
-        needs_analysis = (
-            image_path is not None
-            and (item.classification_uncertain or "Awaiting" in (item.model_status or "") or not item.extracted_features)
-        )
-        if not needs_analysis:
-            continue
-        try:
-            tags = analyze_wardrobe_image(image_path.read_bytes(), f"{item.name} {item.image_name or ''}")
-        except (OSError, ImportError, TypeError, ValueError):
-            continue
-        for field, value in tags.items():
-            setattr(item, field, value)
-        if not item.date_added:
-            item.date_added = date.today().isoformat()
-        WARDROBE_STORE.update(item)
-        changed = True
-    if changed:
-        st.session_state.wardrobe_items = WARDROBE_STORE.load()
 
 
 def _stored_image_path(item: WardrobeItem) -> Path | None:
@@ -108,6 +84,9 @@ def _swatch_color(name: str) -> str:
         "emerald green": "#087f5b", "terracotta": "#c7654a", "cream": "#f3e5c1",
         "navy blue": "#183153", "maroon": "#7f1d35", "cobalt blue": "#2454c4",
         "berry": "#a32d63", "plum": "#6c3b72", "soft white": "#f7f7f2",
+        "olive green": "#78833d", "coral": "#e97968", "teal": "#287d78",
+        "sapphire": "#2454a4", "rose": "#c96c83", "charcoal": "#41464b",
+        "forest green": "#285b43", "dusty rose": "#bd858e",
     }
     return colors.get(name.lower(), "#9aa39c")
 
@@ -185,6 +164,7 @@ def _save_profile_analysis(profile: UserProfile, portrait: bytes | None, body: b
     if portrait:
         profile.profile_image_path = str(WARDROBE_STORE.save_image("profile", "profile.png", portrait, IMAGE_DIR))
     profile.analysis_date = date.today().isoformat()
+    profile.analysis_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     profile.preferred_colors = [color.name for color in recommend_colors(profile.undertone, profile.skin_tone)]
     profile.extracted_features = {
         "face": getattr(face, "feature_ratios", {}) if face else {},
@@ -267,101 +247,168 @@ def _build_analysis_evidence(portrait, body, face, tone, body_result):
     return evidence
 
 
-def _save_wardrobe_uploads(files) -> None:
+def _save_wardrobe_uploads(files):
+    analysis_results = []
+    analysis_cache = st.session_state.setdefault("wardrobe_analysis_cache", {})
+    pending_confirmations = st.session_state.setdefault("wardrobe_pending_confirmations", {})
     for upload in files or []:
         content = upload.getvalue()
         image_hash = _signature(content)
         if any(item.image_hash == image_hash for item in st.session_state.wardrobe_items):
+            analysis_results.append({"filename": upload.name, "saved": False, "decision": "Duplicate image; not saved", "analysis_details": {}})
             continue
-        tags = analyze_wardrobe_image(content, upload.name)
-        item = WardrobeItem(
-            name=Path(upload.name).stem.replace("_", " ").title(),
-            item_id="",
-            image_name=upload.name,
-            image_hash=image_hash,
-            date_added=date.today().isoformat(),
-            **tags,
-        )
-        item = WARDROBE_STORE.add(item)
-        item.image_path = str(WARDROBE_STORE.save_image(item.item_id, upload.name, content, IMAGE_DIR))
-        WARDROBE_STORE.update(item)
-        st.session_state.wardrobe_items.append(item)
+        if image_hash in analysis_cache:
+            cached_result = analysis_cache[image_hash]
+        else:
+            try:
+                cached_result = {"tags": analyze_wardrobe_image(content, upload.name)}
+            except NotClothingImageError as error:
+                cached_result = {"rejected": str(error), "analysis_details": error.analysis_details}
+            except Exception as error:
+                cached_result = {"error": str(error)}
+            analysis_cache[image_hash] = cached_result
+        if cached_result.get("rejected"):
+            analysis_results.append({
+                "filename": upload.name,
+                "saved": False,
+                "decision": "Rejected: no clothing item detected",
+                "analysis_details": cached_result.get("analysis_details", {}),
+            })
+            continue
+        if cached_result.get("error"):
+            analysis_results.append({"filename": upload.name, "saved": False, "decision": "Analysis failed", "analysis_details": {"error": cached_result["error"]}})
+            continue
+        tags = cached_result["tags"]
+        if tags.get("classification_uncertain"):
+            pending_confirmations[image_hash] = {"filename": upload.name, "content": content, "tags": tags}
+            analysis_results.append({
+                "filename": upload.name,
+                "saved": False,
+                "pending_confirmation": True,
+                "pending_id": image_hash,
+                "decision": "Detection uncertain; confirm details before saving",
+                "analysis_details": tags.get("extracted_features", {}).get("analysis_details", {}),
+            })
+            continue
+        item = _persist_wardrobe_item(upload.name, content, image_hash, tags)
+        analysis_results.append({
+            "filename": upload.name,
+            "saved": True,
+            "decision": "Saved",
+            "analysis_details": item.extracted_features.get("analysis_details", {}),
+        })
+    return analysis_results
 
 
-def _retailer_links(query: str) -> list[tuple[str, str]]:
+def _persist_wardrobe_item(filename: str, content: bytes, image_hash: str, tags: dict, confirmation: dict | None = None) -> WardrobeItem:
+    model_details = tags.get("extracted_features", {}).get("analysis_details", {})
+    if confirmation:
+        model_details = {**model_details, "user_confirmation": confirmation}
+        tags = {**tags, "extracted_features": {**tags.get("extracted_features", {}), "analysis_details": model_details}}
+    item = WardrobeItem(
+        name=Path(filename).stem.replace("_", " ").title(),
+        item_id="",
+        image_name=filename,
+        image_hash=image_hash,
+        date_added=date.today().isoformat(),
+        **tags,
+    )
+    item = WARDROBE_STORE.add(item)
+    item.image_path = str(WARDROBE_STORE.save_image(item.item_id, filename, content, IMAGE_DIR))
+    WARDROBE_STORE.update(item)
+    st.session_state.wardrobe_items.append(item)
+    return item
+
+
+def _retailer_links(query: str) -> list[tuple[str, str, str]]:
     encoded = quote_plus(query)
     return [
-        ("Amazon", f"https://www.amazon.in/s?k={encoded}"),
-        ("Myntra", f"https://www.myntra.com/{encoded.replace('+', '-') }"),
-        ("Flipkart", f"https://www.flipkart.com/search?q={encoded}"),
-        ("AJIO", f"https://www.ajio.com/search/?text={encoded}"),
+        ("Amazon", f"https://www.amazon.in/s?k={encoded}", "amazon.in"),
+        ("Myntra", f"https://www.myntra.com/search?q={encoded}", "myntra.com"),
+        ("Flipkart", f"https://www.flipkart.com/search?q={encoded}", "flipkart.com"),
+        ("AJIO", f"https://www.ajio.com/search/?text={encoded}", "ajio.com"),
+        ("Tata CLiQ", f"https://www.tatacliq.com/search/?searchCategory=all&text={encoded}", "tatacliq.com"),
+        ("Nykaa Fashion", f"https://www.nykaafashion.com/search/result/?q={encoded}", "nykaafashion.com"),
+        ("Meesho", f"https://www.meesho.com/search?q={encoded}", "meesho.com"),
+        ("Snapdeal", f"https://www.snapdeal.com/search?keyword={encoded}", "snapdeal.com"),
     ]
 
 
-def _outfit_types(gender: str, occasion: str) -> list[tuple[str, str, str]]:
-    female = {
-        "College": [("Kurti + straight pants", "Semi-fitted", "Emerald Green"), ("Jeans + top", "Relaxed", "Navy Blue"), ("Oversized shirt + jeans", "Relaxed", "Cream")],
-        "Formal": [("Formal trousers + shirt", "Tailored", "Navy Blue"), ("Blazer", "Structured", "Emerald Green"), ("Formal kurti", "Semi-fitted", "Maroon")],
-        "Wedding": [("Saree", "Draped", "Emerald Green"), ("Anarkali", "Fluid", "Maroon"), ("Sharara", "Structured", "Navy Blue")],
-        "Traditional": [("Saree", "Draped", "Emerald Green"), ("Anarkali", "Fluid", "Maroon"), ("Kurti set", "Semi-fitted", "Cream")],
-    }
-    male = {
-        "College": [("Polo + chinos", "Relaxed", "Navy Blue"), ("Shirt + jeans", "Straight", "Emerald Green"), ("T-shirt + trousers", "Relaxed", "Cream")],
-        "Formal": [("Formal shirt + trousers", "Tailored", "Navy Blue"), ("Blazer + trousers", "Structured", "Maroon"), ("Smart-casual shirt + chinos", "Straight", "Emerald Green")],
-        "Wedding": [("Kurta", "Relaxed", "Emerald Green"), ("Nehru jacket + kurta", "Structured", "Maroon"), ("Formal ethnic combination", "Tailored", "Navy Blue")],
-        "Traditional": [("Kurta", "Relaxed", "Emerald Green"), ("Nehru jacket + kurta", "Structured", "Maroon"), ("Formal ethnic combination", "Tailored", "Cream")],
-    }
-    common = [("Casual layered outfit", "Relaxed", "Navy Blue"), ("Polished separates", "Semi-fitted", "Emerald Green"), ("Comfortable tonal outfit", "Relaxed", "Cream")]
-    return (female if gender == "Female" else male if gender == "Male" else {}).get(occasion, common)
-
-
-st.set_page_config(page_title="Smart Style", page_icon="SS", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Smart Style", page_icon="SS", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,400,0,0..1');
-:root { --ink:#1d2421; --muted:#68726d; --paper:#f5f4ef; --panel:#fffef9; --line:#d9ddd5; --coral:#de684e; --teal:#2e6d67; }
+:root { --ink:#2a221d; --muted:#6b5a4f; --paper:#f7f2ee; --panel:#fffdfb; --line:#e5d8cc; --beige:#dcc1a5; --taupe:#b88a68; --soft-taupe:#efe3d7; --chestnut:#5b4233; --accent:#8b6b53; }
 html, body, [class*="css"] { font-family:'Manrope',sans-serif; color:var(--ink); } .stApp { background:var(--paper); }
-[data-testid="stSidebar"] { background:#e6ece5; border-right:1px solid var(--line); }
-.brand { font-size:1.35rem; font-weight:800; letter-spacing:-.04em; } .brand-mark { color:var(--coral); } .eyebrow { color:var(--teal); font:500 .72rem 'DM Mono',monospace; letter-spacing:.11em; text-transform:uppercase; }
+[data-testid="stSidebar"] { display:none; }
+.main .block-container { padding-bottom:7rem; }
+.brand { font-size:1.35rem; font-weight:800; letter-spacing:-.04em; } .brand-mark { color:var(--taupe); } .eyebrow { color:var(--accent); font:500 .72rem 'DM Mono',monospace; letter-spacing:.11em; text-transform:uppercase; }
 .hero { padding:1.1rem 0 1.8rem; border-bottom:1px solid var(--line); } .hero h1 { font-size:clamp(2.3rem,5vw,4.2rem); line-height:.98; letter-spacing:-.075em; max-width:760px; margin:.55rem 0 1rem; } .hero p { color:var(--muted); max-width:580px; line-height:1.6; }
-.metric, .item-card { background:var(--panel); border:1px solid var(--line); padding:1rem; } .metric { min-height:100px; } .metric-label { color:var(--muted); font-size:.76rem; margin-top:.25rem; } .score { color:var(--coral); font-size:1.7rem; font-weight:800; }
-.recommendation { background:var(--teal); color:#f8f8f1; padding:1.3rem; min-height:160px; } .recommendation p { color:#d9e8df; font-size:.85rem; line-height:1.55; }
-.stButton > button { border-radius:0; border:1px solid var(--ink); background:var(--ink); color:white; font-weight:700; } .stButton > button:hover { background:var(--coral); border-color:var(--coral); color:white; }
-[data-testid="stSidebar"] [data-testid="stRadio"] > label { display:block; color:var(--ink); font-weight:800; margin-bottom:.8rem; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] { display:flex; flex-direction:column; gap:.35rem; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label { display:flex; align-items:center; gap:.65rem; min-height:3.2rem; padding:.55rem .7rem; border:1px solid transparent; border-radius:6px; color:var(--ink); font-size:.82rem; font-weight:700; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label:hover { background:#eef2ec; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label:has(input:checked) { background:#fffef9; border-color:var(--teal); color:var(--teal); }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label > div:first-child { display:none; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label::before { display:block; flex:0 0 1.5rem; font-family:'Material Symbols Outlined'; font-size:1.45rem; font-weight:400; line-height:1.2; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label:nth-child(1)::before { content:'person'; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label:nth-child(2)::before { content:'checkroom'; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label:nth-child(3)::before { content:'inventory_2'; }
-[data-testid="stSidebar"] [data-testid="stRadio"] [role="radiogroup"] > label:nth-child(4)::before { content:'calendar_month'; }
+.metric, .item-card { background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:1rem; box-shadow:0 8px 28px rgba(86,62,47,.05); } .metric { min-height:100px; } .metric-label { color:var(--muted); font-size:.76rem; margin-top:.25rem; } .score { color:var(--accent); font-size:1.7rem; font-weight:800; }
+.recommendation { background:linear-gradient(135deg, var(--soft-taupe), var(--beige)); color:var(--ink); padding:1.3rem; min-height:160px; border:1px solid var(--line); border-radius:18px; box-shadow:0 10px 26px rgba(75,58,44,.08); } .recommendation p { color:var(--muted); font-size:.85rem; line-height:1.55; }
+.retailer-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.35rem; margin:.4rem 0; }
+.retailer-link { display:flex; align-items:center; gap:.45rem; min-height:2.4rem; padding:.4rem .5rem; border:1px solid var(--line); background:var(--panel); color:var(--ink)!important; text-decoration:none!important; font-size:.75rem; font-weight:700; border-radius:12px; }
+.retailer-link:hover { border-color:var(--taupe); color:var(--accent)!important; }
+.retailer-link img { width:20px; height:20px; flex:0 0 20px; object-fit:contain; }
+.outfit-retailers { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:.25rem; margin:.35rem 0 .6rem; }
+.outfit-retailers .retailer-link { justify-content:center; min-height:1.9rem; padding:.25rem .3rem; font-size:.66rem; }
+.analysis-link { display:inline-block; margin:.15rem 0 .7rem; color:var(--accent)!important; font-size:.82rem; font-weight:700; text-decoration:underline!important; text-underline-offset:3px; }
+.color-option { display:flex; align-items:center; gap:.55rem; min-height:2.5rem; padding:.45rem .55rem; border:1px solid var(--line); background:var(--panel); font-size:.78rem; font-weight:700; border-radius:12px; }
+.color-swatch { width:1.15rem; height:1.15rem; flex:0 0 1.15rem; border:1px solid #9aa39c; border-radius:50%; }
+div[data-testid="stHorizontalBlock"]:has(.wardrobe-grid-marker) { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1rem; align-items:start; }
+div[data-testid="stHorizontalBlock"]:has(.wardrobe-grid-marker) > [data-testid="stColumn"] { width:auto!important; min-width:0; flex:none; padding:0; }
+[data-testid="stVerticalBlockBorderWrapper"]:has(.wardrobe-card-marker) { height:auto; min-height:0; border:1px solid rgba(184,138,104,.32); border-radius:14px; background:var(--panel); padding:.75rem; box-shadow:0 7px 22px rgba(86,62,47,.06); }
+[data-testid="stVerticalBlockBorderWrapper"]:has(.wardrobe-card-marker) > div { gap:.45rem; }
+[data-testid="stVerticalBlockBorderWrapper"]:has(.wardrobe-card-marker) [data-testid="stImage"] img { width:100%; height:clamp(190px,24vw,260px); object-fit:contain; border-radius:9px; background:#f1eae3; }
+.wardrobe-card-title { color:var(--ink); font-size:1rem; font-weight:800; line-height:1.3; }
+.wardrobe-card-type { color:var(--muted); font-size:.78rem; font-weight:700; }
+.wardrobe-card-meta { display:grid; grid-template-columns:1fr 1fr; gap:.55rem .75rem; padding-top:.35rem; border-top:1px solid var(--line); }
+.wardrobe-meta-label { color:var(--muted); font-size:.65rem; font-weight:700; text-transform:uppercase; }
+.wardrobe-meta-value { color:var(--ink); font-size:.75rem; line-height:1.4; overflow-wrap:anywhere; }
+.wardrobe-image-fallback { display:flex; align-items:center; justify-content:center; min-height:190px; border:1px dashed var(--line); border-radius:10px; color:var(--muted); font-size:.8rem; background:#f7f2ee; }
+.wardrobe-detail-title { color:var(--chestnut); font-size:1.25rem; font-weight:800; }
+@media (max-width:1050px) { div[data-testid="stHorizontalBlock"]:has(.wardrobe-grid-marker) { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+@media (max-width:760px) { div[data-testid="stHorizontalBlock"]:has(.wardrobe-grid-marker) { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media (max-width:460px) { div[data-testid="stHorizontalBlock"]:has(.wardrobe-grid-marker) { grid-template-columns:1fr; } .wardrobe-card-meta { grid-template-columns:1fr; } }
+.recommendation { padding:.9rem; min-height:0; }
+div[data-testid="stHorizontalBlock"]:has(.bottom-nav-marker) { position:fixed; z-index:1000; left:0; bottom:0; width:100vw; box-sizing:border-box; padding:.55rem max(1rem, calc((100vw - 1280px) / 2)) .75rem; background:rgba(255,253,251,.96); backdrop-filter:blur(12px); border-top:1px solid var(--line); box-shadow:0 -8px 24px rgba(86,62,47,.06); }
+div[data-testid="stHorizontalBlock"]:has(.bottom-nav-marker) [data-testid="stColumn"] { min-width:0; }
+div[data-testid="stHorizontalBlock"]:has(.bottom-nav-marker) [data-testid="stBaseButton-secondary"],
+div[data-testid="stHorizontalBlock"]:has(.bottom-nav-marker) [data-testid="stBaseButton-primary"] { width:100%; min-height:2.85rem; border-radius:12px; font-size:.8rem; font-weight:700; }
+div[data-testid="stHorizontalBlock"]:has(.bottom-nav-marker) [data-testid="stBaseButton-primary"] { background:linear-gradient(135deg, var(--soft-taupe), var(--beige)); border-color:var(--taupe); color:var(--chestnut); box-shadow:0 5px 14px rgba(139,107,83,.12); }
+@media (max-width: 680px) { .retailer-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+.stButton > button { border-radius:14px; border:1px solid var(--ink); background:var(--ink); color:white; font-weight:700; } .stButton > button:hover { background:var(--accent); border-color:var(--accent); color:white; }
+div[data-testid="stHeaderActionElements"], div[data-testid="stStatusWidget"] { display:none !important; }
 </style>
 """, unsafe_allow_html=True)
 
 profile = _profile()
-navigation_options = ["Style Profile", "Outfit Recommendations", "My Wardrobe", "Weekly Planner"]
-navigation_views = {option: option for option in navigation_options}
-with st.sidebar:
-    st.markdown('<div class="brand"><span class="brand-mark">/</span> Smart Style</div>', unsafe_allow_html=True)
-    st.caption("Computer vision for personal style.")
-    st.divider()
-    selected_navigation = st.radio("Navigation", navigation_options, key="sidebar_navigation")
-    st.divider()
-    st.markdown('<div class="eyebrow">PROFILE STATUS</div>', unsafe_allow_html=True)
-    st.progress(profile.analysis_count / 3)
-    st.caption(f"{profile.analysis_count}/3 visual signals ready")
-view = navigation_views[selected_navigation]
+nav_labels = ["Profile", "Outfits", "Wardrobe", "Planner"]
+nav_map = {"Profile": ("Style Profile", ":material/person:"), "Outfits": ("Outfit Recommendations", ":material/checkroom:"), "Wardrobe": ("My Wardrobe", ":material/inventory_2:"), "Planner": ("Weekly Planner", ":material/calendar_month:")}
+if "selected_nav" not in st.session_state:
+    st.session_state.selected_nav = "Profile"
+analysis_expanded = st.session_state.pop("_open_analysis_requested", False)
+view = nav_map[st.session_state.selected_nav][0]
+if view in {"Outfit Recommendations", "My Wardrobe", "Weekly Planner"} and profile.analysis_count == 0:
+    st.info("Complete Style Profile first.")
 
 st.markdown('<div class="hero"><div class="eyebrow">SMART STYLE / PERSONAL STUDIO</div><h1>Dress with a little more intention.</h1><p>Use your local style profile, real wardrobe images, and your own weekly rhythm to make outfit decisions.</p></div>', unsafe_allow_html=True)
+navigation_columns = st.columns(4, gap="small")
+for index, (label, (page, icon)) in enumerate(nav_map.items()):
+    with navigation_columns[index]:
+        if index == 0:
+            st.markdown('<span class="bottom-nav-marker"></span>', unsafe_allow_html=True)
+        if st.button(label, key=f"main_nav_{label}", icon=icon, type="primary" if st.session_state.selected_nav == label else "secondary", use_container_width=True):
+            st.session_state.selected_nav = label
+            st.rerun()
 
 if view == "Style Profile":
     st.markdown('<div class="eyebrow">FEATURE 01</div><h2>Style Profile</h2>', unsafe_allow_html=True)
     st.write("Use a clear front-facing image with good lighting. For better body-shape estimation, use an image where the upper/full body is visible.")
+    if st.button("Open Image Analysis", key="open_profile_analysis"):
+        st.session_state._open_analysis_requested = True
+        st.rerun()
     profile.gender = st.selectbox("What is your gender?", GENDERS, index=_index(GENDERS, profile.gender), key="profile_gender")
-    WARDROBE_STORE.save_profile(profile)
     left, right = st.columns([1.05, .95], gap="large")
     with left:
         portrait_camera = st.camera_input("Use camera", key="portrait_camera")
@@ -369,13 +416,8 @@ if view == "Style Profile":
         st.caption("Hold the device vertically. Stand far enough away to include your head, shoulders, hips, feet, and both sides of your body with a little space around the frame.")
         body_camera = st.camera_input("Use camera for full-body image", key="body_camera")
         portrait_file = portrait_camera
-        saved_portrait = Path(profile.profile_image_path) if profile.profile_image_path else None
-        saved_portrait_bytes = saved_portrait.read_bytes() if saved_portrait and saved_portrait.exists() else None
         portrait_bytes = portrait_file.getvalue() if portrait_file else None
         body_bytes = body_camera.getvalue() if body_camera else None
-        display_portrait = portrait_bytes or saved_portrait_bytes
-        if display_portrait:
-            st.image(display_portrait, caption="Actual camera profile image", width=300)
         if st.button("Analyze My Style", use_container_width=True):
             _save_profile_analysis(profile, portrait_bytes, body_bytes)
             st.success("Analysis completed where the local pipeline could determine a result.")
@@ -389,11 +431,17 @@ if view == "Style Profile":
         }
         for label, value in result_cards:
             st.markdown(f'<div class="metric" style="margin-bottom:.55rem"><div class="metric-label">{label}</div><strong>{value}</strong></div>', unsafe_allow_html=True)
-    with st.expander("View Image Analysis"):
+    colors = recommend_colors(profile.undertone, profile.skin_tone)
+    profile_outfits = suggest_body_shape_outfits(profile.body_shape, "Casual", profile.gender)
+    with st.expander("View Image Analysis", expanded=analysis_expanded):
         st.markdown("**Classification details**")
         for label, value in result_cards:
             st.markdown(f"**{label}:** {value}")
             st.caption(explanations[label])
+        st.markdown("**Color guidance**")
+        for color in colors:
+            st.caption(f"{color.name}: {color.reason}")
+        st.caption("Use carefully: " + "; ".join(colors_to_use_carefully(profile.undertone)) + ". These are styling suggestions, not rules.")
         tone_details = st.session_state.get("tone_details")
         if tone_details:
             st.caption(tone_details.description)
@@ -411,191 +459,662 @@ if view == "Style Profile":
             st.json(features)
         st.caption("Pipeline: image acquisition -> RGB/BGR preprocessing -> facial/pose landmarks -> skin ROI and LAB statistics -> deterministic classification.")
     st.markdown('<div class="eyebrow">COLOR GUIDANCE</div><h3>Colors That Suit You</h3>', unsafe_allow_html=True)
-    colors = recommend_colors(profile.undertone, profile.skin_tone)
-    for row in range(0, len(colors), 3):
-        columns = st.columns(3)
-        for column, color in zip(columns, colors[row:row + 3]):
+    st.caption("Eight colors selected from your undertone profile.")
+    for row in range(0, len(colors), 4):
+        columns = st.columns(4)
+        for column, color in zip(columns, colors[row:row + 4]):
             with column:
                 swatch = _swatch_color(color.name)
-                st.markdown(f'<div class="metric"><span style="display:inline-block;width:1.2rem;height:1.2rem;border-radius:50%;background:{swatch};border:1px solid var(--line);vertical-align:middle;margin-right:.45rem"></span><strong>{color.name}</strong><div class="score">{color.score}/100</div><p>{color.reason}</p></div>', unsafe_allow_html=True)
-                with st.expander("Why this color?"):
-                    st.write("Recommended because it is included in the configured palette for the detected undertone and provides suitable contrast with the detected skin-tone category.")
-                    st.caption("Good for: kurtis, dresses, sarees, tops, shirts, or accessories depending on the garment.")
-    st.caption("Lower compatibility with your current color profile means a color may need more careful contrast or styling; it is not an appearance judgment.")
-    st.write("Colors to use carefully: " + ", ".join(colors_to_use_carefully(profile.undertone)))
+                st.markdown(f'<div class="color-option"><span class="color-swatch" style="background:{swatch}"></span>{escape(color.name)}</div>', unsafe_allow_html=True)
+    st.caption("Use carefully: " + ", ".join(colors_to_use_carefully(profile.undertone)) + ".")
+    st.markdown(f"### Outfit ideas for {profile.body_shape or 'a balanced starting shape'}")
+    st.caption("Three easy-to-adapt silhouettes selected for your profile.")
+    outfit_columns = st.columns(3)
+    for number, (column, outfit) in enumerate(zip(outfit_columns, profile_outfits), 1):
+        with column:
+            st.markdown(f'<div class="recommendation"><div class="eyebrow" style="color:#e8c56a">IDEA {number}</div><h4>{escape(outfit.name)}</h4></div>', unsafe_allow_html=True)
+            st.caption(outfit.reason)
 
 elif view == "Outfit Recommendations":
     st.markdown('<div class="eyebrow">FEATURE 02</div><h2>Outfit Recommendations</h2>', unsafe_allow_html=True)
-    gender = st.selectbox("Gender", GENDERS, index=_index(GENDERS, profile.gender), key="recommendation_gender")
-    profile.gender = gender
-    occasion = st.selectbox("What are you dressing for?", OCCASIONS, key="recommendation_occasion")
-    profile.occasion = occasion
-    st.caption("These are outfit types built from your profile, not universal ratings.")
-    colors = recommend_colors(profile.undertone, profile.skin_tone)
-    preferred_color = colors[0].name if colors else "Navy Blue"
-    types = _outfit_types(gender, occasion)
-    wardrobe_candidates = recommend_outfits(profile, st.session_state.wardrobe_items, occasion=occasion, top_k=3)
-    st.markdown("### From Your Wardrobe")
-    if wardrobe_candidates:
-        for candidate in wardrobe_candidates:
-            st.markdown(f"**{' + '.join(item.name for item in candidate.items)}**  ·  {_score(candidate.score)}")
-            item_columns = st.columns(len(candidate.items))
-            for column, item in zip(item_columns, candidate.items):
-                with column:
-                    _image(item)
-                    st.caption(item.name)
-            st.caption("This combination uses only analyzed items already stored in your wardrobe. " + " ".join(candidate.reasons))
+    profile_columns = st.columns(5, gap="small")
+    profile_summary = (
+        ("Gender", profile.gender or "Not set"),
+        ("Skin tone", profile.skin_tone or "Not determined"),
+        ("Undertone", profile.undertone or "Not determined"),
+        ("Face shape", profile.face_shape or "Not determined"),
+        ("Body shape", profile.body_shape or "Not determined"),
+    )
+    for column, (label, value) in zip(profile_columns, profile_summary):
+        with column:
+            st.markdown(f'<div class="metric"><div class="metric-label">{escape(label)}</div><strong>{escape(value)}</strong></div>', unsafe_allow_html=True)
+    gender = st.selectbox("Recommendation gender", GENDERS, index=_index(GENDERS, profile.gender), key="recommendation_gender")
+    occasion = st.selectbox("What are you dressing for?", OCCASIONS, index=_index(OCCASIONS, st.session_state.get("recommendation_occasion", profile.occasion)), key="recommendation_occasion")
+    include_unisex_unknown = st.checkbox("Include Unisex and Unknown market-category items", value=True, key="recommendation_include_unisex_unknown")
+    recommendation_profile = UserProfile(**{**profile.__dict__, "gender": gender, "occasion": occasion})
+    if st.button("Generate Outfits", key="generate_wardrobe_outfits", icon=":material/auto_awesome:"):
+        st.session_state.generated_wardrobe_outfits = recommend_outfits(
+            recommendation_profile,
+            st.session_state.wardrobe_items,
+            occasion=occasion,
+            top_k=8,
+            complete_only=True,
+            include_unisex_unknown=include_unisex_unknown,
+        )
+        st.session_state.generated_wardrobe_outfits_occasion = occasion
+        st.session_state.generated_wardrobe_outfits_gender = gender
+        st.session_state.find_similar_outfit_id = None
+
+    generated = st.session_state.get("generated_wardrobe_outfits", [])
+    generated_occasion = st.session_state.get("generated_wardrobe_outfits_occasion")
+    generated_gender = st.session_state.get("generated_wardrobe_outfits_gender")
+    if generated and (generated_occasion != occasion or generated_gender != gender):
+        generated = []
+    if not st.session_state.wardrobe_items:
+        st.info("Upload actual wardrobe items before generating outfit combinations.")
+    elif generated:
+        if len(generated) < 5:
+            st.info(f"Only {len(generated)} complete wardrobe combinations are currently available. Add more wardrobe items to generate additional outfits.")
+        for number, candidate in enumerate(generated, 1):
+            with st.container(border=True, key=f"recommendation_{candidate.outfit_id}"):
+                st.markdown(f"### {number}. {escape(candidate.name)}")
+                st.caption(f"{escape(candidate.occasion)} · Compatibility {_score(candidate.score)} · Actual wardrobe items")
+                item_columns = st.columns(min(4, len(candidate.items)), gap="small")
+                for index, item in enumerate(candidate.items):
+                    with item_columns[index % len(item_columns)]:
+                        _image(item)
+                        st.caption(f"{item.subcategory or item.category} · {item.color or 'Color not determined'}")
+                st.markdown("**Why this combination**")
+                for reason in candidate.reasons:
+                    st.caption(reason)
+                action_columns = st.columns(2, gap="small")
+                with action_columns[0]:
+                    if st.button("Use My Wardrobe", key=f"use_outfit_{candidate.outfit_id}", icon=":material/calendar_add_on:"):
+                        today = date.today()
+                        week_start = today - timedelta(days=today.weekday())
+                        day_options = [week_start + timedelta(days=offset) for offset in range(7)]
+                        st.session_state.selected_nav = "Planner"
+                        st.session_state.planner_week_start = week_start
+                        st.session_state.planner_target_day = day_options[min(today.weekday(), 6)].isoformat()
+                        st.session_state.planner_action = "add"
+                        st.session_state.planner_detail_day = None
+                        selections = st.session_state.setdefault("planner_temp_selection", {})
+                        selections[st.session_state.planner_target_day] = list(candidate.item_ids)
+                        st.rerun()
+                with action_columns[1]:
+                    if st.button("Find Similar", key=f"find_similar_{candidate.outfit_id}", icon=":material/search:"):
+                        st.session_state.find_similar_outfit_id = candidate.outfit_id
+                if st.session_state.get("find_similar_outfit_id") == candidate.outfit_id:
+                    query = " ".join(
+                        part for item in candidate.items
+                        for part in (gender.lower() if gender != "Prefer not to say" else "", item.color or "", item.subcategory or item.category)
+                    ) + f" {occasion.lower()}"
+                    retailer_links = {name: url for name, url, _ in _retailer_links(query)}
+                    similar_columns = st.columns(5, gap="small")
+                    for column, retailer in zip(similar_columns, ("Amazon", "Flipkart", "Myntra", "Meesho", "AJIO")):
+                        with column:
+                            st.markdown(
+                                f'<a class="retailer-link" href="{escape(retailer_links[retailer], quote=True)}" target="_blank" rel="noopener noreferrer">{retailer}</a>',
+                                unsafe_allow_html=True,
+                            )
+                    st.caption("These links open retailer search results; products, prices, and availability are not verified by Smart Style.")
+    elif st.session_state.get("generated_wardrobe_outfits") is not None:
+        st.info(f"No complete wardrobe combinations match {occasion}. Add compatible tops/bottoms, dresses, shoes, or accessories and try again.")
     else:
-        st.info("No complete analyzed wardrobe combination is available yet. Add wardrobe items for wardrobe-first recommendations.")
-    st.markdown("### Outfit Types")
-    for number, (outfit_type, fit, color) in enumerate(types[:3], 1):
-        color = profile.preferred_colors[(number - 1) % len(profile.preferred_colors)] if profile.preferred_colors else color
-        components = {"color_compatibility": .94 if color == preferred_color else .86, "body_shape_compatibility": .9 if profile.body_shape else .72, "occasion_compatibility": .92, "comfort_practicality": .86, "style_relevance": .84}
-        suitability = weighted_score(components)
-        left, right = st.columns([1.35, .65])
-        with left:
-            st.markdown(f'<div class="recommendation"><div class="eyebrow" style="color:#e8c56a">RECOMMENDATION {number}</div><h3>{color} {outfit_type}</h3><p><b>Type:</b> {outfit_type}<br><b>Color:</b> {color}<br><b>Fit:</b> {fit}<br><b>Occasion:</b> {occasion}</p><p>Why: {color} is in the saved preferred-color palette, the outfit responds to the saved {profile.body_shape or "available body-shape"} profile, and the type matches {occasion.lower()}. Face shape ({profile.face_shape or "not analyzed"}) is retained for future neckline/accessory refinement.</p></div>', unsafe_allow_html=True)
-        with right:
-            st.markdown(f'<div class="metric"><div class="metric-label">STYLE SUITABILITY SCORE</div><div class="score">{_score(suitability)}</div><p>Deterministic profile and occasion rules.</p></div>', unsafe_allow_html=True)
-            query = f"{gender.lower()} {color} {outfit_type}"
-            st.markdown("**Live retailer search**")
-            for retailer, url in _retailer_links(query):
-                st.markdown(f"[{retailer} search results]({url})")
-            st.caption("Links open live retailer search results. No product name, image, price, or URL is invented by this app.")
+        st.info("Choose an occasion and generate combinations from your saved wardrobe.")
+
+    st.markdown(f"### Silhouette ideas for {occasion}")
+    st.caption(f"Styling guidance based on the saved {profile.body_shape or 'body-shape profile'}; these ideas are not wardrobe items.")
+    types = suggest_body_shape_outfits(profile.body_shape, occasion, gender)
+    idea_columns = st.columns(3)
+    for number, (column, outfit) in enumerate(zip(idea_columns, types), 1):
+        with column:
+            st.markdown(f'<div class="recommendation"><div class="eyebrow">IDEA {number}</div><h4>{escape(outfit.name)}</h4></div>', unsafe_allow_html=True)
+            st.caption(outfit.reason)
+    with st.expander("View Image Analysis: colors and outfit reasoning"):
+        colors = recommend_colors(profile.undertone, profile.skin_tone)
+        st.markdown(f"**Color profile:** {profile.undertone or 'Neutral / not analyzed'} undertone")
+        for color in colors:
+            st.caption(f"{color.name}: {color.reason}")
+        st.markdown("**Colors to use carefully**")
+        st.caption("; ".join(colors_to_use_carefully(profile.undertone)) + ". Try them as small accents if you enjoy them.")
+        st.markdown(f"**Why these silhouettes for {profile.body_shape or 'a balanced starting shape'}?**")
+        for outfit in types:
+            st.markdown(f"**{outfit.name}**")
+            st.caption(outfit.reason)
+        st.caption("No Groq or other API key is required. Suggestions use local rules and saved profile data; the shop links open live web searches.")
+    st.caption("Suggestions are deterministic styling guidance, not AI-generated fashion judgments.")
 
 elif view == "My Wardrobe":
     st.markdown('<div class="eyebrow">FEATURE 03</div><h2>My Wardrobe</h2>', unsafe_allow_html=True)
     uploads = st.file_uploader("Upload wardrobe images", type=["jpg", "jpeg", "png"], accept_multiple_files=True, key="wardrobe_uploads")
     if st.button("Analyze and save wardrobe items", use_container_width=True):
         try:
-            _save_wardrobe_uploads(uploads)
-            st.success("Each uploaded image was analyzed locally and saved. Review or edit its tags below.")
+            st.session_state.wardrobe_analysis_results = _save_wardrobe_uploads(uploads)
+            saved_count = sum(result["saved"] for result in st.session_state.wardrobe_analysis_results)
+            rejected_count = sum(result["decision"].startswith("Rejected") for result in st.session_state.wardrobe_analysis_results)
+            if saved_count:
+                st.success(f"Saved {saved_count} clothing item(s) to your wardrobe.")
+            if rejected_count:
+                st.error(f"Rejected {rejected_count} image(s): no clothing item was detected; these images were not saved.")
+            if not uploads:
+                st.info("Choose one or more images to analyze.")
         except (ImportError, TypeError, ValueError) as error:
             st.error(f"Wardrobe analysis failed: {error}")
-    if not st.session_state.wardrobe_items:
+    for result in st.session_state.get("wardrobe_analysis_results", []):
+        if result["decision"].startswith("Rejected"):
+            st.error(f"{result['filename']}: {result['decision']}.")
+        with st.expander(f"Analysis Details: {result['filename']}"):
+            st.markdown(f"**Decision:** {escape(result['decision'])}")
+            st.json(result["analysis_details"] or {"decision": result["decision"]})
+    wardrobe_items = list(st.session_state.wardrobe_items)
+    if not wardrobe_items:
         st.info("Upload actual clothing images to begin your wardrobe.")
-    for item in list(st.session_state.wardrobe_items):
-        with st.expander(item.name):
-            image_column, data_column = st.columns([.35, .65])
+    else:
+        st.markdown("### Your Wardrobe")
+        for row_start in range(0, len(wardrobe_items), 4):
+            row_items = wardrobe_items[row_start:row_start + 4]
+            columns = st.columns(4, gap="medium")
+            with columns[0]:
+                st.markdown('<span class="wardrobe-grid-marker"></span>', unsafe_allow_html=True)
+            for item, column in zip(row_items, columns):
+                uncertain = bool(item.classification_uncertain)
+                clothing_type = "Unable to determine" if uncertain else (item.subcategory or item.category or "Unable to determine")
+                category_value = "Unable to determine" if uncertain else (item.category or "Unable to determine")
+                color_value = item.color or "Unable to determine"
+                occasion_value = " • ".join(item.suitable_occasions) or "Unable to determine"
+                style_value = item.style or "Unable to determine"
+                if Path(item.name).suffix.lower() in {".jpg", ".jpeg", ".png"}:
+                    title_value = f"{item.color} {item.category}" if item.color and not uncertain else (item.category if not uncertain else "Wardrobe Item")
+                else:
+                    title_value = item.name
+                with column:
+                    with st.container(border=True, key=f"wardrobe_card_{item.item_id}"):
+                        st.markdown('<span class="wardrobe-card-marker"></span>', unsafe_allow_html=True)
+                        image_path = _stored_image_path(item)
+                        if image_path:
+                            st.image(str(image_path), use_column_width=True)
+                        else:
+                            st.markdown('<div class="wardrobe-image-fallback">Image unavailable</div>', unsafe_allow_html=True)
+                        st.markdown(
+                            f'<div class="wardrobe-card-title">{escape(title_value)}</div>'
+                            f'<div class="wardrobe-card-type">{escape(clothing_type)}</div>'
+                            f'<div class="wardrobe-card-meta">'
+                            f'<div><div class="wardrobe-meta-label">Color</div><div class="wardrobe-meta-value">{escape(color_value)}</div></div>'
+                            f'<div><div class="wardrobe-meta-label">Secondary</div><div class="wardrobe-meta-value">{escape(item.secondary_color or "Not detected")}</div></div>'
+                            f'<div><div class="wardrobe-meta-label">Occasions</div><div class="wardrobe-meta-value">{escape(occasion_value)}</div></div>'
+                            f'<div><div class="wardrobe-meta-label">Style</div><div class="wardrobe-meta-value">{escape(style_value)}</div></div>'
+                            f'<div><div class="wardrobe-meta-label">Category</div><div class="wardrobe-meta-value">{escape(category_value)}</div></div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+                        if uncertain:
+                            st.caption("Detection uncertain. Review the details before relying on these tags.")
+                        if st.button("View details", key=f"wardrobe_view_{item.item_id}", icon=":material/visibility:", use_container_width=True):
+                            st.session_state.wardrobe_detail_item_id = item.item_id
+                            st.rerun()
+
+    detail_item_id = st.session_state.get("wardrobe_detail_item_id")
+    detail_item = next((item for item in st.session_state.wardrobe_items if item.item_id == detail_item_id), None)
+    if detail_item:
+        detail_path = _stored_image_path(detail_item)
+        detail_type = "Unable to determine" if detail_item.classification_uncertain else (detail_item.subcategory or detail_item.category or "Unable to determine")
+        detail_title = detail_item.name
+        if Path(detail_title).suffix.lower() in {".jpg", ".jpeg", ".png"}:
+            detail_title = f"{detail_item.color} {detail_item.category}" if detail_item.color and not detail_item.classification_uncertain else (detail_item.category if not detail_item.classification_uncertain else "Wardrobe Item")
+        try:
+            date_added = date.fromisoformat(detail_item.date_added).strftime("%d %b %Y") if detail_item.date_added else "Not recorded"
+        except ValueError:
+            date_added = detail_item.date_added or "Not recorded"
+        with st.container(border=True, key=f"wardrobe_detail_panel_{detail_item.item_id}"):
+            st.markdown('<span class="wardrobe-detail-marker"></span>', unsafe_allow_html=True)
+            st.markdown(f'<div class="wardrobe-detail-title">{escape(detail_title)}</div>', unsafe_allow_html=True)
+            image_column, info_column = st.columns([1, 1.15], gap="large")
             with image_column:
-                _image(item, "Actual uploaded image")
-                if _stored_image_path(item) is None:
-                    restore = st.file_uploader("Restore original image", type=["jpg", "jpeg", "png"], key=f"restore_{item.item_id}")
-                    if restore and st.button("Store image", key=f"store_image_{item.item_id}"):
+                if detail_path:
+                    st.image(str(detail_path), use_column_width=True)
+                else:
+                    st.markdown('<div class="wardrobe-image-fallback">Image unavailable</div>', unsafe_allow_html=True)
+                    restore = st.file_uploader("Restore original image", type=["jpg", "jpeg", "png"], key=f"wardrobe_restore_{detail_item.item_id}")
+                    if restore and st.button("Store image", key=f"wardrobe_store_image_{detail_item.item_id}"):
                         content = restore.getvalue()
-                        item.image_name = restore.name
-                        item.image_hash = _signature(content)
-                        item.image_path = str(WARDROBE_STORE.save_image(item.item_id, restore.name, content, IMAGE_DIR))
-                        WARDROBE_STORE.update(item)
+                        detail_item.image_name = restore.name
+                        detail_item.image_hash = _signature(content)
+                        detail_item.image_path = str(WARDROBE_STORE.save_image(detail_item.item_id, restore.name, content, IMAGE_DIR))
+                        WARDROBE_STORE.update(detail_item)
+                        st.session_state.wardrobe_items = WARDROBE_STORE.load()
                         st.rerun()
-                if item.classification_uncertain:
-                    st.warning("Detection uncertain - please confirm the tags.")
-                st.caption(item.model_status or "Local CV analysis")
-            with data_column:
-                item.category = st.text_input("Detected clothing type", item.category, key=f"category_{item.item_id}")
-                item.color = st.text_input("Primary color", item.color or "", key=f"color_{item.item_id}") or None
-                item.secondary_color = st.text_input("Secondary color", item.secondary_color or "", key=f"secondary_{item.item_id}") or None
-                item.style = st.text_input("Style", item.style or "", key=f"style_{item.item_id}") or None
-                item.suitable_occasions = st.multiselect("Suitable occasions", OCCASIONS + ["Family Gathering", "Festive Casual"], default=item.suitable_occasions, key=f"occasions_{item.item_id}")
-                st.caption("Suitable occasions: " + (", ".join(item.suitable_occasions) or "Review manually"))
-                st.markdown("**Extracted wardrobe features**")
-                st.json(item.extracted_features or {"status": "No stored feature vector"})
-                if st.button("Save edits", key=f"edit_{item.item_id}"):
-                    WARDROBE_STORE.update(item)
-                    st.success("Wardrobe metadata saved.")
-                if st.button("Delete item", key=f"delete_{item.item_id}"):
-                    WARDROBE_STORE.delete(item.item_id)
-                    st.session_state.wardrobe_items = [stored for stored in st.session_state.wardrobe_items if stored.item_id != item.item_id]
+            with info_column:
+                st.markdown(f"**Clothing type:** {escape(detail_type)}")
+                st.markdown(f"**Category:** {escape(detail_item.category if not detail_item.classification_uncertain else 'Unable to determine')}")
+                st.markdown(f"**Market category:** {escape(detail_item.market_category or 'Unknown')}")
+                st.markdown(f"**Color:** {escape(detail_item.color or 'Unable to determine')}")
+                if detail_item.secondary_color:
+                    st.markdown(f"**Secondary color:** {escape(detail_item.secondary_color)}")
+                st.markdown(f"**Style:** {escape(detail_item.style or 'Unable to determine')}")
+                st.markdown("**Suitable occasions**")
+                st.markdown(" • ".join(escape(occasion) for occasion in detail_item.suitable_occasions) or "Unable to determine")
+                st.markdown(f"**Date added:** {escape(date_added)}")
+                st.markdown(f"**Last worn:** {escape(detail_item.last_worn or 'Not worn yet')}")
+                st.markdown(f"**Times worn:** {detail_item.times_worn}")
+                if detail_item.classification_uncertain:
+                    st.warning("The existing analysis marked this item as uncertain. Confirm the type and tags before use.")
+                detail_actions = st.columns(3, gap="small")
+                with detail_actions[0]:
+                    if st.button("Edit Details", key=f"wardrobe_edit_open_{detail_item.item_id}", icon=":material/edit:", use_container_width=True):
+                        st.session_state.wardrobe_edit_item_id = detail_item.item_id
+                        st.rerun()
+                with detail_actions[1]:
+                    if st.button("Remove from Wardrobe", key=f"wardrobe_remove_{detail_item.item_id}", icon=":material/delete:", use_container_width=True):
+                        WARDROBE_STORE.delete(detail_item.item_id)
+                        st.session_state.wardrobe_items = [item for item in st.session_state.wardrobe_items if item.item_id != detail_item.item_id]
+                        st.session_state.wardrobe_detail_item_id = None
+                        st.session_state.wardrobe_edit_item_id = None
+                        st.rerun()
+                with detail_actions[2]:
+                    if st.button("Close", key=f"wardrobe_detail_close_{detail_item.item_id}", icon=":material/close:", use_container_width=True):
+                        st.session_state.wardrobe_detail_item_id = None
+                        st.session_state.wardrobe_edit_item_id = None
+                        st.rerun()
+
+            if st.session_state.get("wardrobe_edit_item_id") == detail_item.item_id:
+                revisions = st.session_state.get("wardrobe_edit_revisions", {})
+                revision = revisions.get(detail_item.item_id, 0)
+                st.markdown("#### Edit details")
+                name_value = st.text_input("Item name", value=detail_item.name, key=f"wardrobe_edit_name_{detail_item.item_id}_{revision}")
+                category_value = st.text_input("Clothing type / category", value="" if detail_item.classification_uncertain else detail_item.category, key=f"wardrobe_edit_category_{detail_item.item_id}_{revision}")
+                subcategory_value = st.text_input("Subcategory", value=detail_item.subcategory or "", key=f"wardrobe_edit_subcategory_{detail_item.item_id}_{revision}")
+                market_category_value = st.selectbox(
+                    "Garment market category",
+                    ["Unknown", "Women's", "Men's", "Unisex"],
+                    index=_index(["Unknown", "Women's", "Men's", "Unisex"], detail_item.market_category or "Unknown"),
+                    key=f"wardrobe_edit_market_category_{detail_item.item_id}_{revision}",
+                )
+                edit_columns = st.columns(2, gap="medium")
+                with edit_columns[0]:
+                    color_value = st.text_input("Color", value=detail_item.color or "", key=f"wardrobe_edit_color_{detail_item.item_id}_{revision}")
+                    style_value = st.text_input("Style", value=detail_item.style or "", key=f"wardrobe_edit_style_{detail_item.item_id}_{revision}")
+                with edit_columns[1]:
+                    secondary_value = st.text_input("Secondary color", value=detail_item.secondary_color or "", key=f"wardrobe_edit_secondary_{detail_item.item_id}_{revision}")
+                    occasions_value = st.multiselect("Suitable occasions", OCCASIONS + ["Family Gathering", "Festive Casual"], default=detail_item.suitable_occasions, key=f"wardrobe_edit_occasions_{detail_item.item_id}_{revision}")
+                if st.button("Save Details", key=f"wardrobe_edit_save_{detail_item.item_id}_{revision}", icon=":material/save:"):
+                    detail_item.name = name_value.strip() or detail_item.name
+                    detail_item.category = category_value.strip() or "Uncategorized"
+                    detail_item.subcategory = subcategory_value.strip() or None
+                    detail_item.market_category = market_category_value
+                    detail_item.color = color_value.strip() or None
+                    detail_item.secondary_color = secondary_value.strip() or None
+                    detail_item.style = style_value.strip() or None
+                    detail_item.suitable_occasions = occasions_value
+                    detail_item.classification_uncertain = not bool(category_value.strip())
+                    WARDROBE_STORE.update(detail_item)
+                    st.session_state.wardrobe_items = WARDROBE_STORE.load()
+                    revisions[detail_item.item_id] = revision + 1
+                    st.session_state.wardrobe_edit_revisions = revisions
+                    st.session_state.wardrobe_edit_item_id = None
                     st.rerun()
 
 elif view == "Weekly Planner":
-    st.markdown('<div class="eyebrow">FEATURE 04</div><h2>Weekly Planner</h2>', unsafe_allow_html=True)
-    planning_mode = st.radio("Planning mode", ["AI Planning", "Manual Planning"], horizontal=True, key="planning_mode")
-    if not st.session_state.wardrobe_items:
-        st.info("Add wardrobe images first so the planner can use your actual clothes.")
-    else:
-        st.markdown("**Your wardrobe**")
-        gallery = st.columns(min(5, len(st.session_state.wardrobe_items)))
-        for column, item in zip(gallery, st.session_state.wardrobe_items):
-            with column:
-                _image(item)
-                st.caption(f"{item.name}\n{item.category}")
-        labels = {f"{item.name} [{item.item_id[:6]}]": item for item in st.session_state.wardrobe_items}
-        saved_plan = WARDROBE_STORE.load_weekly_plan()
-        selections = saved_plan.get("days", {}) if "planner_selections" not in st.session_state else st.session_state.planner_selections
-        if planning_mode == "AI Planning":
-            st.markdown("**AI planning suggestions**")
-            ai_occasions, ai_activities = [], []
-            for day in DAYS:
-                day_left, day_middle = st.columns([.25, .75])
-                with day_left:
-                    st.markdown(f"**{day}**")
-                with day_middle:
-                    ai_occasions.append(st.selectbox("Occasion", OCCASIONS, key=f"ai_occasion_{day}"))
-                    ai_activities.append(st.text_input("Activity / timetable", key=f"ai_activity_{day}", placeholder="College + lab, presentation, or family gathering"))
-            if st.button("Generate AI wardrobe suggestions", use_container_width=True):
-                st.session_state.ai_weekly_plan = generate_weekly_plan(profile, st.session_state.wardrobe_items, ai_occasions, DAYS, ai_activities)
-            ai_plan = st.session_state.get("ai_weekly_plan")
-            if ai_plan:
-                for planned_day in ai_plan.days:
-                    if not planned_day.outfit:
-                        st.info(f"{planned_day.day}: no complete wardrobe combination was available.")
-                        continue
-                    st.markdown(f"**{planned_day.day}: {' + '.join(item.name for item in planned_day.outfit.items)}**")
-                    ai_columns = st.columns(len(planned_day.outfit.items))
-                    for column, item in zip(ai_columns, planned_day.outfit.items):
-                        with column:
-                            _image(item)
-                    st.caption(f"Suggestion {_score(planned_day.outfit.score)} · {planned_day.reason} Select or change it below before saving.")
-                    suggestion_labels = [label for label, item in labels.items() if item.item_id in {candidate.item_id for candidate in planned_day.outfit.items}]
-                    keep_column, change_column = st.columns(2)
-                    with keep_column:
-                        if st.button(f"Keep {planned_day.day} suggestion", key=f"keep_{planned_day.day}"):
-                            selections[planned_day.day] = suggestion_labels
-                            st.session_state.planner_selections = selections
+    st.markdown(
+        """
+        <style>
+        .planner-shell { margin-top: .5rem; }
+        .planner-header { display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap; margin-bottom:1rem; }
+        .planner-nav-btn { min-width:3rem; min-height:2.75rem; border:1px solid #e5d8cc; border-radius:14px; background:var(--panel); color:var(--ink); font-weight:800; }
+        .planner-week-range { flex:1; text-align:center; color:var(--chestnut); font-size:1.1rem; font-weight:800; letter-spacing:-.02em; }
+        .planner-grid-wrap { margin-top:.75rem; }
+        div[data-testid="stHorizontalBlock"]:has(.planner-day-marker) { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:.8rem; align-items:start; }
+        div[data-testid="stHorizontalBlock"]:has(.planner-day-marker) > [data-testid="stColumn"] { width:auto!important; min-width:0; flex:none; padding:0; }
+        .stVerticalBlock[class*="st-key-planner_day_"] > div > [data-testid="stVerticalBlockBorderWrapper"] { height:auto; min-height:0; border:1px solid rgba(184,138,104,.3); border-radius:16px; background:rgba(255,255,255,.48); padding:.8rem; }
+        .stVerticalBlock[class*="st-key-planner_day_"] > div > [data-testid="stVerticalBlockBorderWrapper"] > div { gap:.45rem; }
+        [data-testid="stColumn"]:has(.planner-day-marker) [data-testid="stImage"] img { width:100%; height:clamp(140px, 17vw, 200px); object-fit:contain; border-radius:10px; background:#f1eae3; }
+        .planner-day-name { color:var(--muted); font-size:.74rem; font-weight:800; letter-spacing:.09em; text-transform:uppercase; }
+        .planner-date { color:var(--chestnut); font-size:1.05rem; font-weight:800; }
+        .planner-empty { display:flex; align-items:center; justify-content:center; flex-direction:column; width:100%; min-height:7rem; border:1px dashed rgba(184,138,104,.28); border-radius:12px; background:rgba(255,253,251,.42); color:var(--muted); }
+        .planner-plus { font-size:1.8rem; line-height:1; font-weight:300; color:var(--taupe); }
+        .planner-empty-title { margin-top:.2rem; font-weight:700; }
+        .planner-item-title { color:var(--ink); font-size:.9rem; font-weight:800; }
+        .planner-item-meta { color:var(--muted); font-size:.75rem; }
+        [class*="st-key-planner_view_"] [data-testid="stBaseButton-secondary"] p,
+        [class*="st-key-planner_change_"] [data-testid="stBaseButton-secondary"] p,
+        [class*="st-key-planner_remove_"] [data-testid="stBaseButton-secondary"] p { display:none; }
+        [class*="st-key-planner_view_"] [data-testid="stBaseButton-secondary"],
+        [class*="st-key-planner_change_"] [data-testid="stBaseButton-secondary"],
+        [class*="st-key-planner_remove_"] [data-testid="stBaseButton-secondary"] { min-height:2.4rem; padding:.35rem!important; }
+        .planner-detail { margin-top:1.5rem; border:1px solid var(--line); background:var(--panel); border-radius:22px; padding:1rem; }
+        .planner-detail-header { font-size:1.2rem; font-weight:800; color:var(--chestnut); }
+        .planner-detail-grid { display:grid; grid-template-columns:1.1fr 1.3fr; gap:1rem; }
+        .planner-detail-image { width:100%; border-radius:16px; overflow:hidden; border:1px solid var(--line); }
+        .planner-detail-image img { width:100%; height:100%; object-fit:cover; max-height:420px; }
+        .planner-modal { margin-top:1.2rem; border:1px solid var(--line); background:linear-gradient(180deg, var(--panel), rgba(255,255,255,.8)); border-radius:20px; padding:1rem; }
+        .planner-modal-header { display:flex; align-items:center; justify-content:space-between; margin-bottom:.75rem; }
+        .planner-modal-title { color:var(--chestnut); font-size:1.1rem; font-weight:800; }
+        .planner-gallery { display:grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap:.85rem; }
+        .planner-gallery-card { border:1px solid var(--line); border-radius:16px; background:var(--panel); padding:.65rem; }
+        .planner-gallery-card img { width:100%; aspect-ratio:4/5; object-fit:cover; border-radius:10px; }
+        @media (max-width:900px) { div[data-testid="stHorizontalBlock"]:has(.planner-day-marker) { grid-template-columns:repeat(2,minmax(0,1fr)); } .planner-gallery { grid-template-columns:repeat(2,minmax(0,1fr)); } .planner-detail-grid { grid-template-columns:1fr; } }
+        @media (max-width:520px) { div[data-testid="stHorizontalBlock"]:has(.planner-day-marker) { grid-template-columns:1fr; } .planner-gallery { grid-template-columns:1fr; } }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    from datetime import timedelta
+
+    if "planner_week_start" not in st.session_state:
+        today = date.today()
+        st.session_state.planner_week_start = today - timedelta(days=today.weekday())
+    if "planner_target_day" not in st.session_state:
+        st.session_state.planner_target_day = None
+    if "planner_detail_day" not in st.session_state:
+        st.session_state.planner_detail_day = None
+    if "planner_temp_selection" not in st.session_state:
+        st.session_state.planner_temp_selection = {}
+
+    def _week_dates(start_date: date) -> list[date]:
+        return [start_date + timedelta(days=offset) for offset in range(7)]
+
+    def _planner_week_key(value: date) -> str:
+        return value.isoformat()
+
+    def _planner_load_week(week_start: date) -> tuple[dict, dict]:
+        plan = WARDROBE_STORE.load_weekly_plan()
+        weeks = plan.get("weeks", {}) if isinstance(plan, dict) else {}
+        entry = weeks.get(_planner_week_key(week_start), {}) if isinstance(weeks, dict) else {}
+        return entry.get("days", {}), entry.get("activities", {})
+
+    def _planner_save_week(week_start: date, days: dict, activities: dict) -> None:
+        plan = WARDROBE_STORE.load_weekly_plan()
+        if not isinstance(plan, dict):
+            plan = {}
+        weeks = plan.setdefault("weeks", {})
+        weeks[_planner_week_key(week_start)] = {"days": days, "activities": activities}
+        WARDROBE_STORE.save_weekly_plan(plan)
+
+    def _planner_day_item_ids(day_key: str, days: dict) -> list[str]:
+        selected = days.get(day_key, [])
+        if isinstance(selected, str):
+            return [selected]
+        if not isinstance(selected, list):
+            return []
+        return [item_id for item_id in selected if isinstance(item_id, str)]
+
+    def _planner_day_items(day_key: str, days: dict) -> list[WardrobeItem]:
+        item_ids = set(_planner_day_item_ids(day_key, days))
+        return [item for item in st.session_state.wardrobe_items if item.item_id in item_ids]
+
+    def _open_day_action(day_key: str, action: str) -> None:
+        st.session_state.planner_target_day = day_key
+        st.session_state.planner_detail_day = None
+        st.session_state.planner_action = action
+        if day_key not in st.session_state.planner_temp_selection:
+            st.session_state.planner_temp_selection[day_key] = _planner_day_item_ids(day_key, _planner_load_week(st.session_state.planner_week_start)[0])
+
+    week_start = st.session_state.planner_week_start
+    week_dates = _week_dates(week_start)
+    week_days, week_activities = _planner_load_week(week_start)
+    if not isinstance(week_days, dict):
+        week_days = {}
+    if not isinstance(week_activities, dict):
+        week_activities = {}
+
+    header_left, header_center, header_right = st.columns([1, 3, 1])
+    with header_left:
+        if st.button("Previous Week", key="planner_prev_week", icon=":material/chevron_left:", use_container_width=True):
+            st.session_state.planner_week_start = week_start - timedelta(days=7)
+            st.session_state.planner_target_day = None
+            st.session_state.planner_detail_day = None
+            st.session_state.planner_temp_selection = {}
+            st.rerun()
+    with header_center:
+        st.markdown(f"<div class='planner-week-range'>{week_dates[0].strftime('%d %b %Y')} – {week_dates[-1].strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
+        if st.button("Current Week", key="planner_current_week", use_container_width=True):
+            today = date.today()
+            st.session_state.planner_week_start = today - timedelta(days=today.weekday())
+            st.session_state.planner_target_day = None
+            st.session_state.planner_detail_day = None
+            st.session_state.planner_temp_selection = {}
+            st.rerun()
+    with header_right:
+        if st.button("Next Week", key="planner_next_week", icon=":material/chevron_right:", use_container_width=True):
+            st.session_state.planner_week_start = week_start + timedelta(days=7)
+            st.session_state.planner_target_day = None
+            st.session_state.planner_detail_day = None
+            st.session_state.planner_temp_selection = {}
+            st.rerun()
+
+    if st.button("Save Week", use_container_width=True):
+        _planner_save_week(week_start, week_days, week_activities)
+        st.success("Saved")
+
+    for row_start in (0, 4):
+        row_dates = week_dates[row_start:row_start + 4]
+        calendar_columns = st.columns(len(row_dates), gap="small")
+        for current_day, day_column in zip(row_dates, calendar_columns):
+            day_key = current_day.isoformat()
+            chosen_items = _planner_day_items(day_key, week_days)
+            with day_column:
+                with st.container(border=True, key=f"planner_day_{day_key}"):
+                    st.markdown('<span class="planner-day-marker"></span>', unsafe_allow_html=True)
+                    st.markdown(f"<div class='planner-day-name'>{current_day.strftime('%A')}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='planner-date'>{current_day.strftime('%d %b')}</div>", unsafe_allow_html=True)
+                    if chosen_items:
+                        primary = chosen_items[0]
+                        image_path = _stored_image_path(primary)
+                        if image_path:
+                            st.image(str(image_path), use_column_width=True)
+                        else:
+                            st.markdown("<div class='planner-empty'><div class='planner-plus'>+</div><div class='planner-empty-title'>No image</div></div>", unsafe_allow_html=True)
+                        st.markdown(f"<div class='planner-item-title'>{escape(primary.name)}</div>", unsafe_allow_html=True)
+                        if primary.category:
+                            st.markdown(f"<div class='planner-item-meta'>{escape(primary.category)}</div>", unsafe_allow_html=True)
+                        if len(chosen_items) > 1:
+                            st.caption(f"{len(chosen_items)} pieces selected")
+                        if week_activities.get(day_key):
+                            st.caption(escape(week_activities[day_key]))
+                        action_columns = st.columns(3, gap="small")
+                        with action_columns[0]:
+                            if st.button("View", key=f"planner_view_{day_key}", icon=":material/visibility:", help="View outfit details", use_container_width=True):
+                                st.session_state.planner_detail_day = day_key
+                                st.rerun()
+                        with action_columns[1]:
+                            if st.button("Change", key=f"planner_change_{day_key}", icon=":material/edit:", help="Change outfit", use_container_width=True):
+                                _open_day_action(day_key, "change")
+                                st.rerun()
+                        with action_columns[2]:
+                            if st.button("Remove", key=f"planner_remove_{day_key}", icon=":material/delete:", help="Remove outfit", use_container_width=True):
+                                week_days.pop(day_key, None)
+                                week_activities.pop(day_key, None)
+                                _planner_save_week(week_start, week_days, week_activities)
+                                st.rerun()
+                    else:
+                        st.markdown("<div class='planner-empty'><div class='planner-plus'>+</div><div class='planner-empty-title'>Add Outfit</div></div>", unsafe_allow_html=True)
+                        if st.button("Add Outfit", key=f"planner_add_{day_key}", use_container_width=True):
+                            _open_day_action(day_key, "add")
                             st.rerun()
-                    with change_column:
-                        if st.button(f"Change {planned_day.day} suggestion", key=f"change_{planned_day.day}"):
-                            selections[planned_day.day] = []
-                            st.session_state.planner_selections = selections
-                            st.rerun()
-        st.markdown("**Choose wardrobe items for each day. Selection is always yours.**")
-        for day in DAYS:
-            left, middle, right = st.columns([.22, .38, .4])
-            with left:
-                st.markdown(f"**{day}**")
-            with middle:
-                current_labels = [label for label in selections.get(day, []) if label in labels]
-                selections[day] = st.multiselect("Outfit items", list(labels), default=current_labels, key=f"planner_items_{day}")
-            with right:
-                st.text_input("Activity / timetable (optional)", value=saved_plan.get("activities", {}).get(day, ""), key=f"activity_{day}")
-        st.session_state.planner_selections = selections
-        if st.button("Save Weekly Plan", use_container_width=True):
-            plan = {"days": selections, "activities": {day: st.session_state.get(f"activity_{day}", "") for day in DAYS}, "saved_on": date.today().isoformat()}
-            combinations = [tuple(sorted(values)) for values in selections.values() if values]
-            repeated = {combo for combo in combinations if combinations.count(combo) > 1}
-            WARDROBE_STORE.save_weekly_plan(plan)
-            if repeated:
-                st.warning("Plan saved. The same complete combination appears more than once; individual pieces may still be reused.")
+
+    detail_day = st.session_state.get("planner_detail_day")
+    if detail_day:
+        detail_items = _planner_day_items(detail_day, week_days)
+        if detail_items:
+            st.markdown("<div class='planner-detail'>", unsafe_allow_html=True)
+            st.markdown(f"<div class='planner-detail-header'>{date.fromisoformat(detail_day).strftime('%A')} — {date.fromisoformat(detail_day).strftime('%d %b')}</div>", unsafe_allow_html=True)
+            detail_cols = st.columns([1.2, 1.5])
+            with detail_cols[0]:
+                primary = detail_items[0]
+                image_path = _stored_image_path(primary)
+                if image_path:
+                    st.markdown("<div class='planner-detail-image'>", unsafe_allow_html=True)
+                    st.image(str(image_path), use_column_width=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
+            with detail_cols[1]:
+                for item in detail_items:
+                    st.markdown(f"**{escape(item.name)}**")
+                    if item.category:
+                        st.caption(f"Category: {item.category}")
+                    if item.color:
+                        st.caption(f"Color: {item.color}")
+                    if item.style:
+                        st.caption(f"Style: {item.style}")
+                    if item.suitable_occasions:
+                        st.caption(f"Suitable occasions: {', '.join(item.suitable_occasions)}")
+                    if item.last_worn:
+                        st.caption(f"Last worn: {item.last_worn}")
+                    if item.times_worn:
+                        st.caption(f"Times worn: {item.times_worn}")
+                if st.button("Change Outfit", key=f"planner_detail_change_{detail_day}", use_container_width=True):
+                    _open_day_action(detail_day, "change")
+                    st.session_state.planner_detail_day = None
+                    st.rerun()
+                if st.button("Remove Outfit", key=f"planner_detail_remove_{detail_day}", use_container_width=True):
+                    week_days.pop(detail_day, None)
+                    week_activities.pop(detail_day, None)
+                    _planner_save_week(week_start, week_days, week_activities)
+                    st.session_state.planner_detail_day = None
+                    st.rerun()
+                if st.button("Close", key=f"planner_detail_close_{detail_day}", use_container_width=True):
+                    st.session_state.planner_detail_day = None
+                    st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    target_day = st.session_state.get("planner_target_day")
+    if target_day:
+        st.markdown("<div class='planner-modal'>", unsafe_allow_html=True)
+        st.markdown(f"<div class='planner-modal-header'><div class='planner-modal-title'>Add Outfit — {escape(date.fromisoformat(target_day).strftime('%A, %d %b'))}</div></div>", unsafe_allow_html=True)
+        option = st.radio("Choose an option", ["Add from My Wardrobe", "Add recommended outfit", "Upload from Device"], horizontal=True, key=f"planner_option_{target_day}")
+        activity_value = week_activities.get(target_day, "")
+        activity_input = st.text_input("Activity / timetable (optional)", value=activity_value, key=f"planner_activity_{target_day}")
+        week_activities[target_day] = activity_input
+        if option == "Add from My Wardrobe":
+            if not st.session_state.wardrobe_items:
+                st.info("Upload wardrobe images first so you can plan with your actual clothes.")
             else:
-                st.success("Weekly plan saved.")
-        if st.button("Mark saved outfits as worn", use_container_width=True):
-            selected_ids = {labels[label].item_id for values in selections.values() for label in values if label in labels}
-            for item in st.session_state.wardrobe_items:
-                if item.item_id in selected_ids:
-                    item.last_worn = date.today().isoformat()
-                    item.times_worn += 1
-                    WARDROBE_STORE.update(item)
-            st.success("Wear history updated for the saved wardrobe selections.")
-        st.markdown('<div class="eyebrow">MY WEEKLY PLAN</div>', unsafe_allow_html=True)
-        for day in DAYS:
-            selected = [labels[label] for label in selections.get(day, []) if label in labels]
-            if not selected:
-                continue
-            st.markdown(f"### {day}")
-            st.caption(st.session_state.get(f"activity_{day}", saved_plan.get("activities", {}).get(day, "")) or "No activity added")
-            item_columns = st.columns(len(selected))
-            for column, item in zip(item_columns, selected):
-                with column:
-                    _image(item)
-                    st.caption(item.name)
+                selected_ids = list(st.session_state.planner_temp_selection.get(target_day, []))
+                for item in st.session_state.wardrobe_items:
+                    selected = item.item_id in selected_ids
+                    image_path = _stored_image_path(item)
+                    st.markdown("<div class='planner-gallery-card'>", unsafe_allow_html=True)
+                    if image_path:
+                        st.image(str(image_path), use_column_width=True)
+                    st.markdown(f"<div style='margin-top:.5rem; font-weight:700; color:var(--ink);'>{escape(item.name)}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size:.72rem; color:var(--muted);'>{escape(item.category)}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size:.72rem; color:var(--muted);'>{escape(item.color or 'Color not detected')}</div>", unsafe_allow_html=True)
+                    if st.button("Selected" if selected else "Select item", key=f"planner_select_{item.item_id}_{target_day}", use_container_width=True):
+                        current = list(st.session_state.planner_temp_selection.get(target_day, []))
+                        if item.item_id in current:
+                            current.remove(item.item_id)
+                        else:
+                            current.append(item.item_id)
+                        st.session_state.planner_temp_selection[target_day] = current
+                        st.rerun()
+                    st.markdown("</div>", unsafe_allow_html=True)
+                if st.button("Add to selected day", key=f"planner_add_to_day_{target_day}", use_container_width=True):
+                    selected_ids = st.session_state.planner_temp_selection.get(target_day, [])
+                    if selected_ids:
+                        week_days[target_day] = selected_ids
+                        _planner_save_week(week_start, week_days, week_activities)
+                        st.session_state.planner_target_day = None
+                        st.session_state.planner_temp_selection.pop(target_day, None)
+                        st.rerun()
+                    else:
+                        st.warning("Select at least one wardrobe item.")
+        elif option == "Add recommended outfit":
+            recommendation_occasion = st.selectbox("Outfit occasion", OCCASIONS, key=f"planner_recommendation_occasion_{target_day}")
+            planner_recommendations = recommend_outfits(
+                profile,
+                st.session_state.wardrobe_items,
+                occasion=recommendation_occasion,
+                top_k=8,
+                complete_only=True,
+                include_unisex_unknown=True,
+            )
+            if not planner_recommendations:
+                st.info(f"No complete wardrobe combinations are available for {recommendation_occasion.lower()}.")
+            else:
+                selected_recommendation = st.radio(
+                    "Choose a wardrobe combination",
+                    range(len(planner_recommendations)),
+                    format_func=lambda index: planner_recommendations[index].name,
+                    key=f"planner_recommendation_choice_{target_day}",
+                )
+                candidate = planner_recommendations[selected_recommendation]
+                st.caption(" ".join(candidate.reasons))
+                recommendation_columns = st.columns(min(4, len(candidate.items)), gap="small")
+                for index, item in enumerate(candidate.items):
+                    with recommendation_columns[index % len(recommendation_columns)]:
+                        _image(item)
+                        st.caption(item.subcategory or item.category)
+                if st.button("Add recommended outfit to this day", key=f"planner_recommendation_add_{target_day}", icon=":material/calendar_add_on:"):
+                    week_days[target_day] = list(candidate.item_ids)
+                    _planner_save_week(week_start, week_days, week_activities)
+                    st.session_state.planner_target_day = None
+                    st.session_state.planner_temp_selection.pop(target_day, None)
+                    st.rerun()
+        else:
+            uploaded = st.file_uploader("Upload outfit image", type=["jpg", "jpeg", "png"], key=f"planner_upload_{target_day}")
+            if uploaded:
+                content = uploaded.getvalue()
+                st.image(content, use_column_width=True)
+                upload_hash = _signature(content)
+                cached_uploads = st.session_state.setdefault("planner_upload_analysis", {})
+                if upload_hash not in cached_uploads:
+                    try:
+                        cached_uploads[upload_hash] = {"tags": analyze_wardrobe_image(content, uploaded.name)}
+                    except NotClothingImageError as error:
+                        cached_uploads[upload_hash] = {"rejected": str(error), "analysis_details": error.analysis_details}
+                    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+                        cached_uploads[upload_hash] = {"error": str(error)}
+                upload_analysis = cached_uploads[upload_hash]
+                if upload_analysis.get("rejected"):
+                    st.error("Cannot add this image. No clothing was detected, so it was not saved.")
+                    with st.expander("Analysis Details: rejected planner upload"):
+                        st.json(upload_analysis.get("analysis_details", {}))
+                elif upload_analysis.get("error"):
+                    st.error(f"Wardrobe analysis failed: {upload_analysis['error']}")
+                else:
+                    tags = upload_analysis["tags"]
+                    with st.expander("Analysis Details: planner upload"):
+                        st.json(tags.get("extracted_features", {}).get("analysis_details", {}))
+                    outfit_name = st.text_input("Item name", value=Path(uploaded.name).stem.replace("_", " ").title(), key=f"planner_upload_name_{target_day}")
+                    outfit_category = st.text_input("Category", value=tags.get("category", ""), key=f"planner_upload_category_{target_day}")
+                    outfit_subcategory = st.text_input("Clothing type", value=tags.get("subcategory", ""), key=f"planner_upload_subcategory_{target_day}")
+                    outfit_color = st.text_input("Primary color", value=tags.get("color", ""), key=f"planner_upload_color_{target_day}")
+                    outfit_style = st.text_input("Style", value=tags.get("style", "") or "", key=f"planner_upload_style_{target_day}")
+                    outfit_occasions = st.multiselect("Suitable occasions", OCCASIONS + ["Family Gathering", "Festive Casual"], default=tags.get("suitable_occasions", []), key=f"planner_upload_occasions_{target_day}")
+                    outfit_market_category = st.selectbox("Garment market category", ["Unknown", "Women's", "Men's", "Unisex"], index=_index(["Unknown", "Women's", "Men's", "Unisex"], tags.get("market_category", "Unknown")), key=f"planner_upload_market_category_{target_day}")
+                    if st.button("Add uploaded outfit to this day", key=f"planner_upload_save_{target_day}", use_container_width=True):
+                        item = WardrobeItem(
+                            name=outfit_name,
+                            item_id="",
+                            category=outfit_category or "Uncategorized",
+                            subcategory=outfit_subcategory or "Unable to determine",
+                            market_category=outfit_market_category,
+                            color=outfit_color or tags.get("color"),
+                            secondary_color=tags.get("secondary_color"),
+                            confidence=tags.get("confidence"),
+                            style=outfit_style or tags.get("style"),
+                            suitable_occasions=outfit_occasions,
+                            date_added=date.today().isoformat(),
+                            image_name=uploaded.name,
+                            image_hash=upload_hash,
+                            model_status=tags.get("model_status", "Local vision analysis"),
+                            extracted_features=tags.get("extracted_features", {}),
+                            classification_uncertain=bool(tags.get("classification_uncertain")),
+                        )
+                        item = WARDROBE_STORE.add(item)
+                        item.image_path = str(WARDROBE_STORE.save_image(item.item_id, uploaded.name, content, IMAGE_DIR))
+                        WARDROBE_STORE.update(item)
+                        st.session_state.wardrobe_items = WARDROBE_STORE.load()
+                        week_days[target_day] = [item.item_id]
+                        _planner_save_week(week_start, week_days, week_activities)
+                        st.session_state.planner_target_day = None
+                        st.session_state.planner_temp_selection.pop(target_day, None)
+                        st.rerun()
+        if st.button("Close", key=f"planner_close_modal_{target_day}", use_container_width=True):
+            st.session_state.planner_target_day = None
+            st.session_state.planner_temp_selection.pop(target_day, None)
+            st.rerun()
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if not st.session_state.wardrobe_items:
+        st.info("Upload actual wardrobe images to start planning outfits manually.")

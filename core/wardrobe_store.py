@@ -67,6 +67,11 @@ class WardrobeStore:
     def load_weekly_plan(self) -> dict:
         if not self.weekly_plan_path.exists():
             return {}
+        try:
+            data = json.loads(self.weekly_plan_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return data if isinstance(data, dict) else {}
 
     @property
     def profile_path(self) -> Path:
@@ -84,6 +89,7 @@ class WardrobeStore:
             "occasion": profile.occasion,
             "profile_image_path": profile.profile_image_path,
             "analysis_date": profile.analysis_date,
+            "analysis_timestamp": profile.analysis_timestamp,
             "extracted_features": profile.extracted_features,
         }
         self.profile_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
@@ -92,10 +98,26 @@ class WardrobeStore:
         if not self.profile_path.exists():
             return UserProfile()
         try:
-            return UserProfile(**json.loads(self.profile_path.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError, TypeError):
-            return UserProfile()
-        try:
-            return json.loads(self.weekly_plan_path.read_text(encoding="utf-8"))
+            data = json.loads(self.profile_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return {}
+            return UserProfile()
+        if not isinstance(data, dict):
+            return UserProfile()
+
+        text_fields = (
+            "gender", "face_shape", "skin_tone", "undertone", "body_shape",
+            "profile_image_path", "analysis_date", "analysis_timestamp",
+        )
+        profile_data = {
+            field: data.get(field) if isinstance(data.get(field), str) else None
+            for field in text_fields
+        }
+        profile_data["preferred_colors"] = [
+            value for value in data.get("preferred_colors", []) if isinstance(value, str)
+        ] if isinstance(data.get("preferred_colors", []), list) else []
+        profile_data["style_preferences"] = [
+            value for value in data.get("style_preferences", []) if isinstance(value, str)
+        ] if isinstance(data.get("style_preferences", []), list) else []
+        profile_data["occasion"] = data.get("occasion") if isinstance(data.get("occasion"), str) else "Everyday"
+        profile_data["extracted_features"] = data.get("extracted_features") if isinstance(data.get("extracted_features"), dict) else {}
+        return UserProfile(**profile_data)

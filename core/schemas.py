@@ -17,6 +17,7 @@ class WardrobeItem:
     mask_path: Optional[str] = None
     model_status: Optional[str] = None
     subcategory: Optional[str] = None
+    market_category: str = "Unknown"
     style: Optional[str] = None
     fit: Optional[str] = None
     occasion: Optional[str] = None
@@ -42,6 +43,7 @@ class UserProfile:
     occasion: str = "Everyday"
     profile_image_path: Optional[str] = None
     analysis_date: Optional[str] = None
+    analysis_timestamp: Optional[str] = None
     extracted_features: dict = field(default_factory=dict)
 
     @property

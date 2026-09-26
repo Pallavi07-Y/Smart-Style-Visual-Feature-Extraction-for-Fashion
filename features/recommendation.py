@@ -12,6 +12,23 @@ class OutfitCandidate:
     score: float
     components: dict[str, float]
     reasons: tuple[str, ...]
+    occasion: str = "Everyday"
+
+    @property
+    def outfit_id(self) -> str:
+        return "outfit-" + "-".join(sorted(item.item_id for item in self.items))
+
+    @property
+    def item_ids(self) -> tuple[str, ...]:
+        return tuple(item.item_id for item in self.items)
+
+    @property
+    def image_paths(self) -> tuple[str | None, ...]:
+        return tuple(item.image_path for item in self.items)
+
+    @property
+    def name(self) -> str:
+        return " + ".join(item.name for item in self.items)
 
 
 def recommend_outfits(
@@ -19,14 +36,24 @@ def recommend_outfits(
     wardrobe_items: Iterable[WardrobeItem] | None = None,
     occasion: str | None = None,
     top_k: int = 5,
+    *,
+    complete_only: bool = False,
+    include_unisex_unknown: bool = True,
 ) -> list[OutfitCandidate]:
     """Generate explainable outfit candidates using only supplied wardrobe items."""
     if top_k < 1:
         raise ValueError("top_k must be at least 1.")
-    items = [item for item in (wardrobe_items if wardrobe_items is not None else profile.wardrobe_items) if item and item.item_id]
+    items = [
+        item for item in (wardrobe_items if wardrobe_items is not None else profile.wardrobe_items)
+        if item and item.item_id and _market_compatible(item, profile.gender, include_unisex_unknown)
+    ]
     target_occasion = occasion or profile.occasion or "Everyday"
     candidates: list[OutfitCandidate] = []
-    for outfit in _candidate_combinations(items):
+    for outfit in _candidate_combinations(items, complete_only=complete_only):
+        if complete_only and not is_complete_outfit(outfit):
+            continue
+        if not is_outfit_suitable_for_occasion(outfit, target_occasion):
+            continue
         candidate = score_outfit(profile, outfit, target_occasion)
         candidates.append(candidate)
     return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)[:top_k]
@@ -58,10 +85,39 @@ def score_outfit(
     }
     score = weighted_score(components)
     reasons = _explain(components, categories, target_occasion, items)
-    return OutfitCandidate(items=items, score=score, components=components, reasons=reasons)
+    return OutfitCandidate(items=items, score=score, components=components, reasons=reasons, occasion=target_occasion)
 
 
-def _candidate_combinations(items: Sequence[WardrobeItem]):
+def is_complete_outfit(outfit: Sequence[WardrobeItem]) -> bool:
+    categories = {_category(item) for item in outfit}
+    return "dress" in categories or {"top", "bottom"}.issubset(categories)
+
+
+def is_outfit_suitable_for_occasion(outfit: Sequence[WardrobeItem], occasion: str) -> bool:
+    """Reject wardrobe combinations whose tagged main garments miss the occasion."""
+    garment_categories = {"top", "bottom", "dress", "outerwear"}
+    garments = [item for item in outfit if _category(item) in garment_categories]
+    tagged_garments = [item for item in garments if item.suitable_occasions]
+    if not tagged_garments:
+        return True
+
+    target = occasion.strip().lower()
+    occasion_groups = (
+        {"formal", "interview", "presentation"},
+        {"traditional", "wedding"},
+    )
+    accepted = {target}
+    for group in occasion_groups:
+        if target in group:
+            accepted = group
+            break
+    return all(
+        bool(accepted & {value.strip().lower() for value in item.suitable_occasions})
+        for item in tagged_garments
+    )
+
+
+def _candidate_combinations(items: Sequence[WardrobeItem], complete_only: bool = False):
     tops = [item for item in items if _category(item) in {"top", "outerwear"}]
     bottoms = [item for item in items if _category(item) in {"bottom"}]
     dresses = [item for item in items if _category(item) == "dress"]
@@ -83,9 +139,20 @@ def _candidate_combinations(items: Sequence[WardrobeItem]):
                 for layer in layers[:1] or [None]:
                     yielded = True
                     yield tuple(item for item in (top, bottom, shoe, layer) if item)
-    if not yielded:
+    if not yielded and not complete_only:
         for item in items:
             yield (item,)
+
+
+def _market_compatible(item: WardrobeItem, gender: str | None, include_unisex_unknown: bool) -> bool:
+    market = (getattr(item, "market_category", None) or "Unknown").strip().lower()
+    user_gender = (gender or "").strip().lower()
+    if user_gender not in {"female", "male"}:
+        return True
+    expected = "women's" if user_gender == "female" else "men's"
+    if market == expected:
+        return True
+    return include_unisex_unknown and market in {"unisex", "unknown", ""}
 
 
 def _category(item: WardrobeItem) -> str:

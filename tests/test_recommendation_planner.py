@@ -2,7 +2,7 @@ import unittest
 
 from core.schemas import UserProfile, WardrobeItem
 from features.planner import generate_weekly_plan, regenerate_day
-from features.recommendation import recommend_outfits, score_outfit
+from features.recommendation import is_outfit_suitable_for_occasion, recommend_outfits, score_outfit
 
 
 def item(item_id, category, color, name=None):
@@ -32,6 +32,31 @@ class RecommendationPlannerTests(unittest.TestCase):
         self.assertTrue(results)
         self.assertTrue(all(item.item_id in known for result in results for item in result.items))
 
+    def test_complete_only_recommendations_exclude_single_items(self):
+        results = recommend_outfits(self.profile, self.items, "Casual", top_k=8, complete_only=True)
+        self.assertTrue(results)
+        self.assertTrue(all(len(result.items) >= 2 for result in results))
+        self.assertTrue(all(result.occasion == "Casual" for result in results))
+        self.assertTrue(all(result.item_ids and result.outfit_id and result.image_paths for result in results))
+
+    def test_recommendations_filter_incompatible_market_category(self):
+        wardrobe = [
+            item("womens-top", "Top", "green"),
+            item("womens-bottom", "Bottom", "black"),
+            item("mens-top", "Top", "blue"),
+            item("mens-bottom", "Bottom", "grey"),
+        ]
+        wardrobe[0].market_category = "Women's"
+        wardrobe[1].market_category = "Women's"
+        wardrobe[2].market_category = "Men's"
+        wardrobe[3].market_category = "Men's"
+        profile = UserProfile(gender="Female")
+
+        results = recommend_outfits(profile, wardrobe, "College", top_k=8, complete_only=True, include_unisex_unknown=False)
+
+        self.assertTrue(results)
+        self.assertTrue(all(not {"mens-top", "mens-bottom"} & set(result.item_ids) for result in results))
+
     def test_empty_wardrobe(self):
         self.assertEqual(recommend_outfits(UserProfile(), [], "Everyday"), [])
 
@@ -55,6 +80,16 @@ class RecommendationPlannerTests(unittest.TestCase):
         work = recommend_outfits(self.profile, self.items, "Work", top_k=1)[0]
         weekend = recommend_outfits(self.profile, self.items, "Weekend", top_k=1)[0]
         self.assertNotEqual(work.components["occasion_compatibility"], weekend.components["occasion_compatibility"])
+
+    def test_explicit_wardrobe_occasions_prevent_unrelated_recommendations(self):
+        casual_dress = item("casual-dress", "Dress", "beige")
+        casual_dress.suitable_occasions = ["Casual", "Travel"]
+        traditional_dress = item("traditional-dress", "Dress", "green")
+        traditional_dress.suitable_occasions = ["Traditional", "Wedding"]
+
+        self.assertFalse(is_outfit_suitable_for_occasion([casual_dress], "Traditional"))
+        self.assertTrue(is_outfit_suitable_for_occasion([casual_dress], "Casual"))
+        self.assertTrue(is_outfit_suitable_for_occasion([traditional_dress], "Wedding"))
 
 
 if __name__ == "__main__":

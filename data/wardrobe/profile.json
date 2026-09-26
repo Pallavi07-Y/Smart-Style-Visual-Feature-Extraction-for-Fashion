@@ -1,7 +1,7 @@
 {
-  "gender": "Male",
+  "gender": "Female",
   "face_shape": "Diamond",
-  "skin_tone": "Deep",
+  "skin_tone": "Deep-medium",
   "undertone": "Warm",
   "body_shape": "Inverted triangle",
   "preferred_colors": [
@@ -9,32 +9,42 @@
     "Terracotta",
     "Cream",
     "Navy blue",
-    "Maroon"
+    "Maroon",
+    "Olive green",
+    "Coral",
+    "Teal"
   ],
   "style_preferences": [],
-  "occasion": "Outdoor",
+  "occasion": "College",
   "profile_image_path": "C:\\Users\\avire\\Desktop\\MAIN PROJECTS\\smartstyle\\Smart-Style-Visual-Feature-Extraction-for-Fashion\\data\\wardrobe\\images\\profile_profile.png",
-  "analysis_date": "2026-09-25",
+  "analysis_date": "2026-09-26",
+  "analysis_timestamp": "2026-09-26T21:02:13+05:30",
   "extracted_features": {
     "face": {
-      "face_length_width": 1.1768,
-      "jaw_cheek_width": 0.8045,
-      "forehead_cheek_width": 0.8686,
-      "cheek_forehead_width": 1.1513
+      "face_length_width": 1.1434,
+      "jaw_cheek_width": 0.8097,
+      "forehead_cheek_width": 0.8687,
+      "cheek_forehead_width": 1.1512
     },
     "skin": {
       "lab_mean": [
-        76.98,
-        139.68,
-        141.67
+        96.11,
+        138.41,
+        146.0
       ],
       "lab_std": [
-        18.35,
-        4.21,
-        3.37
+        32.61,
+        3.29,
+        4.19
       ],
-      "sample_count": 5115
+      "sample_count": 16084
     },
-    "body": {}
+    "body": {
+      "shoulder_width": 178.2044,
+      "hip_width": 107.8471,
+      "shoulder_hip_ratio": 1.652,
+      "torso_length": 243.432,
+      "leg_length": 121.391
+    }
   }
 }
